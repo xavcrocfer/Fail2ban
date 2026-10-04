@@ -1908,7 +1908,7 @@ write_fail2ban_config() {
 
 start_fail2ban() {
     log_step "Validation et démarrage de Fail2ban"
-    local help st i jail banned
+    local help st i jail banned sock
     [[ -e $F2B_LOG ]] || install -m 0640 /dev/null "$F2B_LOG"
 
     help=$(fail2ban-client --help 2>&1 || true)
@@ -1920,6 +1920,17 @@ start_fail2ban() {
             die "Configuration Fail2ban invalide (sauvegardes : ${BACKUP_DIR})."
     fi
     log_ok "Configuration valide"
+
+    # Socket orphelin après un arrêt brutal (coupure, crash) : le script SysV refuse
+    # alors de démarrer. Sous systemd, fail2ban-server -x le supprime lui-même.
+    if ! fail2ban-client ping >/dev/null 2>&1; then
+        for sock in /run/fail2ban/fail2ban.sock /var/run/fail2ban/fail2ban.sock; do
+            if [[ -S $sock ]]; then
+                rm -f -- "$sock"
+                log_info "Socket orphelin supprimé : ${sock}"
+            fi
+        done
+    fi
 
     svc_enable fail2ban
     svc_restart fail2ban
@@ -2893,7 +2904,11 @@ cleanup() {
 on_error() {
     local rc=$? line=$1 cmd=$2
     trap - ERR
-    log_error "Erreur inattendue (code ${rc}) ligne ${line} : ${cmd}"
+    if [[ $cmd == return* ]]; then
+        log_error "Arrêt suite à l'échec ci-dessus (code ${rc})."
+    else
+        log_error "Erreur inattendue (code ${rc}) ligne ${line} : ${cmd}"
+    fi
     ssh_rollback
     log_error "Détails : ${LOG_FILE} — sauvegardes : ${BACKUP_DIR}"
     exit "$rc"
