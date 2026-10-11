@@ -10,11 +10,13 @@ S=/src/setup.sh
 # Abstraction init : systemd (timer) ou OpenRC/cron (Alpine)
 if [[ -d /run/systemd/system ]]; then
     f2b_active() { systemctl is-active --quiet fail2ban; }
+    f2b_restart() { systemctl restart fail2ban; }
     report_scheduled() { systemctl is-enabled --quiet fail2ban-report.timer; }
     report_calendar() { sed -n 's/^OnCalendar=//p' /etc/systemd/system/fail2ban-report.timer; }
     report_gone() { [[ ! -e /etc/systemd/system/fail2ban-report.timer ]] && ! systemctl is-active --quiet fail2ban-report.timer; }
 else
     f2b_active() { rc-service fail2ban status >/dev/null 2>&1; }
+    f2b_restart() { rc-service fail2ban restart >/dev/null 2>&1; }
     report_scheduled() { grep -qs fail2ban-report /etc/crontabs/root /etc/cron.d/fail2ban-report; }
     report_gone() { ! report_scheduled; }
     # « mm hh jour mois jsem » de la ligne cron
@@ -71,6 +73,35 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["version"]
 fail2ban-report --stdout --no-geoip >/tmp/rep2.txt 2>&1 || fail "2e rapport : code $?"
 grep -q "Rien de nouveau\|déjà bannie" /tmp/rep2.txt || fail "2e rapport : delta non calculé"
 ok "rapport : section Nouveautés, état mémorisé (600), delta au 2e passage"
+
+# Contrôles de sécurité sur un système réel : sshd -T, base, puis ban absent du pare-feu
+grep -q "^REPORT_CHECKS=yes" $conf || fail "REPORT_CHECKS absent de report.conf"
+chk=$(sed -n '/^CONTRÔLES DE SÉCURITÉ/,/^$/p' /tmp/rep.txt)
+for title in "Connexions SSH réussies" "Configuration effective de sshd" "Cohérence Fail2ban" \
+    "Comptes visés" "Base de données Fail2ban"; do
+    [[ $chk == *"$title"* ]] || fail "contrôle « ${title} » absent : ${chk}"
+done
+[[ $chk == *"PermitRootLogin"* && $chk != *"sshd -T » indisponible"* ]] || fail "sshd -T non lu : ${chk}"
+[[ $chk == *"intégrité ok"* ]] || fail "santé de la base : ${chk}"
+[[ $chk != *"ne protège pas"* ]] || fail "port sshd ↔ jail incohérent après installation : ${chk}"
+ok "contrôles : sshd -T lu, ports sshd couverts par la jail, base intègre"
+BAN=198.51.100.66
+fail2ban-client set sshd banip $BAN >/dev/null || fail "banip impossible"
+sleep 2
+out=$(fail2ban-report --stdout --no-geoip --checks firewall 2>&1)
+[[ $out == *"[OK]"*"tous présents dans le pare-feu"* ]] || fail "ban réel non retrouvé dans le pare-feu : $(grep -A2 Cohérence <<<"$out")"
+# Règles vidées dans le dos de Fail2ban (rechargement du pare-feu, script tiers…)
+if command -v nft >/dev/null && nft list tables 2>/dev/null | grep -q f2b; then
+    nft list tables | awk '/f2b/ {print $2, $3}' | while read -r fam tbl; do nft delete table "$fam" "$tbl"; done
+else
+    for c in $(iptables-save | sed -n 's/^:\(f2b-[^ ]*\).*/\1/p'); do iptables -F "$c"; done
+fi
+out=$(fail2ban-report --stdout --no-geoip --checks firewall 2>&1)
+[[ $out == *"/!\\ Cohérence Fail2ban"*"absent(s) du pare-feu"* && $out == *"sshd : "*"$BAN"* ]] ||
+    fail "règles vidées non détectées : $(grep -A3 Cohérence <<<"$out")"
+ok "ban réel présent dans le pare-feu → OK ; règles vidées → ALERTE en tête ($BAN)"
+fail2ban-client set sshd unbanip $BAN >/dev/null 2>&1 || true
+f2b_restart
 
 # 3. Port 25 : TLS toujours obligatoire (plus d'opportuniste « may »)
 SMTP_PASSWORD='s3cret-test' bash "$S" "${COMMON[@]}" --email admin@example.org \

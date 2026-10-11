@@ -1,6 +1,7 @@
 #!/bin/bash
 # Lance les tests d'intégration dans des conteneurs jetables (podman ou docker).
 #   tests/integration/run.sh [debian13|rocky9|alpine322 …]
+#   F2B_TESTS=test_install.sh tests/integration/run.sh debian13
 # Chaque distribution : image construite depuis images/Containerfile.<nom>, conteneur
 # avec init réel (systemd ou OpenRC), dépôt monté en lecture seule sur /src.
 set -Euo pipefail
@@ -8,7 +9,8 @@ cd "$(dirname "$0")/../.." || exit 1
 ENGINE=$(command -v podman || command -v docker) || { echo "podman ou docker requis" >&2; exit 1; }
 DISTROS=("$@")
 ((${#DISTROS[@]})) || DISTROS=(debian13 rocky9 alpine322)
-TESTS=(test_ssh_rollback.sh test_install.sh test_recidive_restore.sh)
+# F2B_TESTS="test_install.sh …" pour n'en lancer qu'une partie
+read -r -a TESTS <<<"${F2B_TESTS:-test_ssh_rollback.sh test_install.sh test_recidive_restore.sh}"
 failed=()
 
 for d in "${DISTROS[@]}"; do
@@ -16,7 +18,9 @@ for d in "${DISTROS[@]}"; do
     echo "════ ${d}"
     "$ENGINE" build -q -t "$img" -f "tests/integration/images/Containerfile.$d" tests/integration/images >/dev/null ||
         { failed+=("$d:build"); continue; }
-    run_opts=(-d --name "$name" -v "$PWD:/src:ro,Z")
+    # NET_ADMIN : sans lui, les actions de ban nftables/iptables échouent (« Operation
+    # not permitted ») et Fail2ban liste des IP « bannies » qui ne sont pas bloquées
+    run_opts=(-d --name "$name" -v "$PWD:/src:ro,Z" --cap-add NET_ADMIN --cap-add NET_RAW)
     [[ $d != alpine* && $(basename "$ENGINE") == podman ]] && run_opts+=(--systemd=always)
     "$ENGINE" run "${run_opts[@]}" "$img" >/dev/null || { failed+=("$d:run"); continue; }
     sleep 5
