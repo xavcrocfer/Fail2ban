@@ -34,7 +34,13 @@ sudo ./setup.sh --help     # toutes les options
   comparaison avec la période précédente, alertes si une jail est tombée.
 - **Contrôles de sécurité** dans chaque rapport (voir plus bas) : connexions SSH réussies,
   configuration effective de sshd, bans réellement présents dans le pare-feu, comptes visés,
-  santé de la base. Une ALERTE remonte en tête du rapport et dans le sujet (⚠).
+  santé de la base ; état du système (mises à jour, redémarrage, ports, comptes et clés SSH,
+  services, disque, heure). Une ALERTE remonte en tête du rapport et dans le sujet (⚠).
+- **Alertes quotidiennes** (`--alert-only`, 07:30 par défaut) : les contrôles tournent chaque
+  jour, mais un mail ne part **que** si une ALERTE nouvelle apparaît. Le même incident n'est
+  pas renvoyé tant qu'il dure (rappel tous les `ALERT_REMIND_DAYS` jours, 7 par défaut).
+- **Masquage** : un mot de passe tapé par erreur dans le champ « login » est journalisé en
+  clair par sshd ; ces noms n'apparaissent jamais dans un mail (`REPORT_REDACT=yes`).
 - **Section « Nouveautés »** : grâce à une mémoire entre deux rapports, seules les évolutions
   ressortent — jail disparue/ajoutée, nouveau pays, nouveau réseau actif, IP qui reviennent.
 - **Profil LAN** : tout ban d'une IP interne (RFC 1918, CGNAT, ULA…) est signalé comme
@@ -98,7 +104,8 @@ sudo SMTP_PASSWORD='mot-de-passe' ./setup.sh -y \
 | `--profile vps\|lan` | profil de la machine (défaut : détecté) |
 | `--report-period week\|month` | rapport hebdomadaire ou mensuel le 1er (défaut : week en VPS, month en LAN) |
 | `--report-day`, `--report-time` | jour (hebdo) et heure (défaut : lundi 08:00) |
-| `--no-report`, `--no-recidive-mail` | pas de rapport (retire aussi une planification existante) / pas d'email de récidive |
+| `--no-report`, `--no-recidive-mail` | pas de rapport ni d'alertes (retire aussi une planification existante) / pas d'email de récidive |
+| `--alert-time HH:MM`, `--no-alerts` | heure des contrôles quotidiens (défaut 07:30) / rapport périodique seul |
 | `--force-hypervisor` | installer malgré la détection d'un hyperviseur (déconseillé) |
 | `--detect` | afficher la détection et quitter |
 | `--uninstall` | supprimer la configuration installée |
@@ -194,6 +201,21 @@ bloquer le rapport.
 | `firewall` | chaque ban actif est présent dans nftables / iptables / ipset | une IP « bannie » n'est pas dans le pare-feu : action de ban en échec, règles vidées par un rechargement |
 | `accounts` | noms d'utilisateur visés par les échecs | ATTENTION : compte réel non standard visé (nom connu de l'attaquant), ou comptes réels exposés alors que les mots de passe sont acceptés |
 | `database` | taille, intégrité (`PRAGMA quick_check`), profondeur d'historique, `dbpurgeage` | base absente ou corrompue |
+| `updates` | mises à jour en attente d'après le **cache local** (apt, dnf/yum, apk : aucun téléchargement), redémarrage requis (`/run/reboot-required`, `needs-restarting -r`, noyau remplacé) | ATTENTION : mises à jour de sécurité, redémarrage nécessaire |
+| `ports` | sockets en écoute hors boucle locale (`ss`), mémorisés d'un rapport à l'autre | ATTENTION : nouveau port en écoute |
+| `local_accounts` | comptes avec shell, clés `authorized_keys` (empreintes SHA256 identiques à `ssh-keygen -lf`, chemins de `AuthorizedKeysFile`) | ALERTE : clé ajoutée pour root, compte d'UID 0 autre que root. ATTENTION : clé ajoutée pour un autre compte, nouveau compte avec shell |
+| `services` | `systemctl --failed` / `rc-status --crashed` | ALERTE : fail2ban, sshd ou pare-feu en échec. ATTENTION : autre service |
+| `disk` | espace et inodes de `/`, `/var`, `/var/log`, `/var/lib/fail2ban`… | ALERTE ≥ 97 % (journaux et base ne peuvent plus s'écrire), ATTENTION ≥ 90 % |
+| `time` | synchronisation NTP (`timedatectl`, `chronyc`) | ATTENTION : horloge non synchronisée |
+
+### Mode alertes
+
+`fail2ban-report --alert-only` (timer `fail2ban-alert` ou cron quotidien) exécute les contrôles
+sur les dernières 24 h et n'envoie un mail court que pour les alertes **nouvelles** (ou dont le
+rappel est dû). Mémoire séparée : `/var/lib/fail2ban-setup/report-state-alerts.json` (0600) ;
+la référence du rapport périodique n'est jamais modifiée. Une alerte incluse dans un rapport
+périodique envoyé est considérée comme signalée ; une alerte résolue qui revient est renvoyée.
+Aperçu sans rien mémoriser : `fail2ban-report --alert-only --stdout`.
 
 Les données viennent de la base SQLite de Fail2ban (90 jours d'historique) et de
 `fail2ban-client`. Le pays des IP est obtenu par `whois` (désactivable : `REPORT_GEOIP=no`).
@@ -231,7 +253,8 @@ tests/integration/run.sh debian13   # une seule distribution
 Ils couvrent : refus hyperviseur et `--force-hypervisor`, installation non interactive,
 Postfix TLS strict, `--no-report`, profil LAN/VPS et planification hebdo/mensuelle, mémoire
 du rapport, contrôles de sécurité sur système réel (ban vérifié dans nftables/iptables, puis
-règles vidées → ALERTE), retour arrière SSH (SIGKILL de l'installateur, coupure de session, confirmation,
+règles vidées → ALERTE), contrôles de niveau 2 réels (clé SSH ajoutée à root → ALERTE), mode
+alertes (envoi unique puis silence), `--alert-time` / `--no-alerts`, retour arrière SSH (SIGKILL de l'installateur, coupure de session, confirmation,
 mode non interactif) et restauration de la récidive.
 
 Les scripts Python installés vivent dans `scripts/` (source de vérité, testables

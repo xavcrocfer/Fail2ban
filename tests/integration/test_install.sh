@@ -14,13 +14,22 @@ if [[ -d /run/systemd/system ]]; then
     report_scheduled() { systemctl is-enabled --quiet fail2ban-report.timer; }
     report_calendar() { sed -n 's/^OnCalendar=//p' /etc/systemd/system/fail2ban-report.timer; }
     report_gone() { [[ ! -e /etc/systemd/system/fail2ban-report.timer ]] && ! systemctl is-active --quiet fail2ban-report.timer; }
+    alert_scheduled() { systemctl is-enabled --quiet fail2ban-alert.timer; }
+    alert_calendar() { sed -n 's/^OnCalendar=//p' /etc/systemd/system/fail2ban-alert.timer; }
+    alert_gone() { [[ ! -e /etc/systemd/system/fail2ban-alert.timer ]] && ! systemctl is-active --quiet fail2ban-alert.timer; }
 else
     f2b_active() { rc-service fail2ban status >/dev/null 2>&1; }
     f2b_restart() { rc-service fail2ban restart >/dev/null 2>&1; }
-    report_scheduled() { grep -qs fail2ban-report /etc/crontabs/root /etc/cron.d/fail2ban-report; }
+    # Lignes cron du rapport périodique (hors contrôles quotidiens --alert-only)
+    report_lines() { grep -hs fail2ban-report /etc/crontabs/root /etc/cron.d/fail2ban-report | grep -v -e '^#' -e '--alert-only' || true; }
+    alert_lines() { grep -hs -- 'fail2ban-report --alert-only' /etc/crontabs/root /etc/cron.d/fail2ban-alert | grep -v '^#' || true; }
+    report_scheduled() { [[ -n $(report_lines) ]]; }
     report_gone() { ! report_scheduled; }
     # « mm hh jour mois jsem » de la ligne cron
-    report_calendar() { grep -hs fail2ban-report /etc/crontabs/root /etc/cron.d/fail2ban-report | grep -v '^#' | awk '{print $1, $2, $3, $4, $5}'; }
+    report_calendar() { report_lines | awk '{print $1, $2, $3, $4, $5}'; }
+    alert_scheduled() { [[ -n $(alert_lines) ]]; }
+    alert_calendar() { alert_lines | awk '{print $1, $2, $3, $4, $5}'; }
+    alert_gone() { ! alert_scheduled; }
 fi
 COMMON=(-y --keep-ssh-port --ignore-ip 10.0.0.0/8)
 
@@ -64,6 +73,11 @@ cal=$(report_calendar)
 [[ $cal == "*-*-01 08:00:00" || $cal == "0 8 1 * *" ]] || fail "planification mensuelle attendue (« ${cal} »)"
 grep -q "le 1er de chaque mois" /tmp/inst.log || fail "résumé mensuel absent"
 ok "profil LAN détecté → rapport mensuel le 1er (${cal})"
+alert_scheduled || fail "contrôles quotidiens non planifiés"
+cal=$(alert_calendar)
+[[ $cal == "*-*-* 07:30:00" || $cal == "30 7 * * *" ]] || fail "contrôles quotidiens à 07:30 attendus (« ${cal} »)"
+grep -q "^REPORT_REDACT=yes" $conf && grep -q "^ALERT_REMIND_DAYS=7" $conf || fail "REPORT_REDACT / ALERT_REMIND_DAYS absents"
+ok "mode alertes planifié chaque jour à 07:30 (${cal}), masquage actif"
 [[ ! -e /var/lib/fail2ban-setup/report-state.json ]] || fail "l'aperçu (--until-now) ne doit pas mémoriser l'état"
 fail2ban-report --stdout --no-geoip --save-state >/tmp/rep.txt 2>&1 || fail "fail2ban-report : code $?"
 grep -q "NOUVEAUTÉS" /tmp/rep.txt || fail "section Nouveautés absente"
@@ -85,6 +99,28 @@ done
 [[ $chk == *"intégrité ok"* ]] || fail "santé de la base : ${chk}"
 [[ $chk != *"ne protège pas"* ]] || fail "port sshd ↔ jail incohérent après installation : ${chk}"
 ok "contrôles : sshd -T lu, ports sshd couverts par la jail, base intègre"
+for title in "Mises à jour et redémarrage" "Ports en écoute" "Comptes locaux et clés SSH" \
+    "Services en échec" "Espace disque" "Synchronisation de l'heure"; do
+    [[ $chk == *"$title"* ]] || fail "contrôle « ${title} » absent : ${chk}"
+done
+[[ $chk == *"tcp/22 ("* ]] || fail "port SSH en écoute non vu : $(grep -A1 'Ports en' <<<"$chk")"
+[[ $(grep -A1 "Espace disque" <<<"$chk") != *"impossible"* ]] || fail "espace disque non lu"
+[[ $(grep "Mises à jour" <<<"$chk") == *"en attente ("* ]] || fail "cache paquets non lu : $(grep 'Mises à jour' <<<"$chk")"
+ok "contrôles niveau 2 lus sur le système réel (paquets, ports dont tcp/22, comptes, services, disque, heure)"
+
+# Clé SSH ajoutée à root dans le dos de l'administrateur → ALERTE, empreinte de ssh-keygen
+fail2ban-report --stdout --no-geoip --save-state --checks local_accounts >/dev/null 2>&1 || fail "mémorisation des clés"
+install -d -m 700 /root/.ssh
+[[ -f /root/.ssh/authorized_keys ]] && cp -a /root/.ssh/authorized_keys /tmp/ak.bak
+rm -f /tmp/intrus /tmp/intrus.pub
+ssh-keygen -q -t ed25519 -N "" -C intrus -f /tmp/intrus || fail "ssh-keygen"
+cat /tmp/intrus.pub >>/root/.ssh/authorized_keys
+fp=$(ssh-keygen -lf /tmp/intrus.pub | awk '{print $2}')
+out=$(fail2ban-report --stdout --no-geoip --checks local_accounts 2>&1)
+[[ $out == *"/!\\ Comptes locaux et clés SSH : clé(s) SSH ajoutée(s) pour root : ssh-ed25519 ${fp}"* ]] ||
+    fail "clé ajoutée à root non détectée (attendu ${fp}) : $(grep -A3 'Comptes locaux' <<<"$out")"
+if [[ -f /tmp/ak.bak ]]; then cp -a /tmp/ak.bak /root/.ssh/authorized_keys; else rm -f /root/.ssh/authorized_keys; fi
+ok "clé SSH ajoutée à root → ALERTE en tête, empreinte identique à ssh-keygen (${fp})"
 BAN=198.51.100.66
 fail2ban-client set sshd banip $BAN >/dev/null || fail "banip impossible"
 sleep 2
@@ -100,13 +136,25 @@ out=$(fail2ban-report --stdout --no-geoip --checks firewall 2>&1)
 [[ $out == *"/!\\ Cohérence Fail2ban"*"absent(s) du pare-feu"* && $out == *"sshd : "*"$BAN"* ]] ||
     fail "règles vidées non détectées : $(grep -A3 Cohérence <<<"$out")"
 ok "ban réel présent dans le pare-feu → OK ; règles vidées → ALERTE en tête ($BAN)"
+# Mode alertes réel : aperçu, envoi unique (file Postfix), puis silence tant que ça dure
+AST=/var/lib/fail2ban-setup/report-state-alerts.json  # créé par le 1er rapport envoyé
+before=$(cat "$AST" 2>/dev/null || true)
+out=$(fail2ban-report --alert-only --stdout --no-geoip 2>&1)
+[[ $out == *"[ALERTE]"*"Cohérence Fail2ban"*"[nouvelle]"* ]] || fail "aperçu des alertes : ${out}"
+[[ $(cat "$AST" 2>/dev/null || true) == "$before" ]] || fail "l'aperçu ne doit pas modifier l'état des alertes"
+err=$(fail2ban-report --alert-only --no-geoip 2>&1) || fail "envoi des alertes : ${err}"
+[[ $err == *"envoyée(s) à admin@example.org"* ]] || fail "alerte non envoyée : ${err}"
+[[ $(stat -c %a "$AST") == 600 ]] || fail "état des alertes non protégé"
+err=$(fail2ban-report --alert-only --no-geoip 2>&1)
+[[ $err == *"aucune alerte nouvelle"*"déjà signalée"* ]] || fail "alerte renvoyée deux fois : ${err}"
+ok "--alert-only : aperçu, 1 envoi réel, puis silence tant que l'incident dure (état 600)"
 fail2ban-client set sshd unbanip $BAN >/dev/null 2>&1 || true
 f2b_restart
 
 # 3. Port 25 : TLS toujours obligatoire (plus d'opportuniste « may »)
 SMTP_PASSWORD='s3cret-test' bash "$S" "${COMMON[@]}" --email admin@example.org \
     --smtp-host smtp.example.org --smtp-port 25 --smtp-user alert@example.org --smtp-tls encrypt \
-    --profile vps --report-period week --report-day mar \
+    --profile vps --report-period week --report-day mar --alert-time 6:15 \
     >/tmp/inst25.log 2>&1 || fail "réinstallation port 25 : code $?"
 [[ $(pc smtp_tls_security_level) == encrypt ]] || fail "port 25 : encrypt attendu ($(pc smtp_tls_security_level))"
 ok "port 25 + --smtp-tls encrypt → TLS obligatoire (jamais « may »)"
@@ -115,6 +163,10 @@ cal=$(report_calendar)
 [[ $cal == "Tue *-*-* 08:00:00" || $cal == "0 8 * * 2" ]] || fail "planification hebdo mardi attendue (« ${cal} »)"
 grep -q '^HOST_PROFILE=vps' /var/lib/fail2ban-setup/answers.env || fail "profil non mémorisé"
 ok "--profile vps --report-period week --report-day mar → mardi 08:00 (${cal}), mémorisé"
+cal=$(alert_calendar)
+[[ $cal == "*-*-* 06:15:00" || $cal == "15 6 * * *" ]] || fail "--alert-time 6:15 non appliqué (« ${cal} »)"
+ok "--alert-time 6:15 → contrôles quotidiens à 06:15 (${cal})"
+bash "$S" -y --alert-time 25:00 >/dev/null 2>&1 && fail "--alert-time 25:00 doit être refusé"
 bash "$S" -y --profile dmz >/dev/null 2>&1 && fail "--profile dmz doit être refusé"
 bash "$S" -y --report-period daily >/dev/null 2>&1 && fail "--report-period daily doit être refusé"
 det=$(bash "$S" --detect 2>&1)  # pas de « | grep -q » : SIGPIPE sous pipefail
@@ -123,11 +175,18 @@ ok "options invalides refusées ; --detect affiche le profil détecté"
 bash "$S" -y --smtp-tls may >/dev/null 2>&1 && fail "--smtp-tls may doit être refusé"
 ok "--smtp-tls may refusé"
 
-# 4. --no-report retire réellement la planification
+# 4. --no-alerts puis --no-report retirent réellement les planifications
+SMTP_PASSWORD='s3cret-test' bash "$S" "${COMMON[@]}" --email admin@example.org --no-alerts >/tmp/noal.log 2>&1 || fail "--no-alerts : code $?"
+alert_gone || fail "contrôles quotidiens toujours planifiés après --no-alerts"
+report_scheduled || fail "--no-alerts ne doit pas retirer le rapport périodique"
+ok "--no-alerts : contrôles quotidiens retirés, rapport périodique conservé"
+SMTP_PASSWORD='s3cret-test' bash "$S" "${COMMON[@]}" --alert-time 07:00 >/dev/null 2>&1 || fail "réactivation des alertes"
+alert_scheduled || fail "contrôles quotidiens non replanifiés"
 bash "$S" "${COMMON[@]}" --no-report >/tmp/norep.log 2>&1 || fail "--no-report : code $?"
 report_gone || fail "planification du rapport toujours présente après --no-report"
+alert_gone || fail "contrôles quotidiens toujours planifiés après --no-report"
 grep -q "Plus aucun rapport ne sera envoyé" /tmp/norep.log || fail "message de désactivation absent"
-ok "--no-report : planification désactivée et supprimée"
+ok "--no-report : rapport ET contrôles quotidiens désactivés et supprimés"
 
 # 5. --force-hypervisor : installation tolérée avec avertissement
 mkdir -p /etc/pve
