@@ -21,13 +21,18 @@ sudo ./setup.sh --help     # toutes les options
 
 - **Changement assisté du port SSH** si sshd écoute sur le port 22 : SELinux (`semanage`),
   firewalld / ufw, socket systemd, validation `sshd -t`, **test de connexion obligatoire et
-  retour arrière automatique** si la connexion n'est pas confirmée sous 5 minutes.
+  retour arrière automatique** si la connexion n'est pas confirmée sous 5 minutes. Ce retour
+  arrière est **indépendant du script** (timer systemd transitoire, ou processus détaché sans
+  systemd) : il a lieu même si l'installateur est tué ou la session SSH coupée.
+- **Refus des hyperviseurs** : Proxmox VE, hôte KVM/libvirt, Xen dom0, LXD/Incus, VirtualBox
+  hôte → arrêt (code 3) avant toute modification. Les VM et VPS invités restent pris en charge.
 - **Rapport hebdomadaire HTML + texte** (timer systemd ou cron) : bans par jour, par jail,
   top des IP avec pays, réseaux /24 les plus actifs, récidives, comparaison avec la période
   précédente, alertes si une jail est tombée.
 - **Email à chaque récidive** (en français, avec extrait whois).
 - **Relais SMTP authentifié via Postfix** (Gmail, OVH, Office 365, Brevo…) avec email de test
-  et contrôle de la file d'attente.
+  et contrôle de la file d'attente. **TLS toujours obligatoire** (y compris port 25) et
+  certificat du relais **vérifié** par défaut : les identifiants ne partent jamais en clair.
 - **Robuste** : idempotent (relançable, réponses précédentes proposées par défaut), sauvegarde
   de chaque fichier modifié, journal complet, verrou anti-exécution concurrente, mode
   non interactif, compatible `curl … | sudo bash`, désinstallation propre.
@@ -79,8 +84,10 @@ sudo SMTP_PASSWORD='mot-de-passe' ./setup.sh -y \
 | `--ignore-ip "IP …"` | IP/CIDR jamais bannies |
 | `--email`, `--from` | destinataire(s) / expéditeur |
 | `--smtp-host`, `--smtp-port`, `--smtp-user` | relais Postfix (mot de passe : `SMTP_PASSWORD`) |
+| `--smtp-tls NIVEAU` | `secure` (défaut : TLS + certificat vérifié) ou `encrypt` (relais interne auto-signé) |
 | `--report-day`, `--report-time` | planification (défaut : lundi 08:00) |
-| `--no-report`, `--no-recidive-mail` | désactiver rapport / email de récidive |
+| `--no-report`, `--no-recidive-mail` | pas de rapport (retire aussi une planification existante) / pas d'email de récidive |
+| `--force-hypervisor` | installer malgré la détection d'un hyperviseur (déconseillé) |
 | `--detect` | afficher la détection et quitter |
 | `--uninstall` | supprimer la configuration installée |
 
@@ -91,6 +98,10 @@ Les seuils se règlent par variables d'environnement :
 ```bash
 sudo SSH_MAXRETRY=3 RECIDIVE_BANTIME=90d ./setup.sh
 ```
+
+Délais du changement de port : `SSH_CONFIRM_TIMEOUT` (300 s) et `SSH_RB_GRACE` (120 s, marge
+du retour arrière indépendant). Codes de retour : `0` succès, `1` erreur, `3` hyperviseur
+détecté, `130` interruption.
 
 ## Fichiers installés
 
@@ -124,7 +135,11 @@ Journal : `/var/log/fail2ban-setup.log` — sauvegardes : `/var/backups/fail2ban
   journaux là où il s'était arrêté ; sans précaution, un reboot entre deux bans « effacerait »
   les bans déjà comptés (limite de la jail `recidive` standard). `fail2ban-recidive-restore`,
   lancé par systemd après chaque démarrage (`ExecStartPost`), relit ces bans dans la base et
-  les réinjecte (`fail2ban-client set sshd-recidive attempt`). Sans systemd (Alpine, Devuan),
+  les réinjecte (`fail2ban-client set sshd-recidive attempt`). La déduplication se fait **par
+  IP et par ban** : il attend que la jail ait fini de relire le journal, ignore les bans déjà
+  relus (lignes `[sshd-recidive] Found <IP> - <date>`) et ceux déjà injectés depuis ce
+  démarrage (`/var/lib/fail2ban-setup/recidive-restore.json`). `--dry-run` montre ce qui
+  serait restauré. Sans systemd (Alpine, Devuan),
   il est exécuté par le script d'installation ; après un redémarrage manuel :
   `fail2ban-recidive-restore`.
 - **OpenSSH ≥ 9.8** journalise sous `sshd-session` : le filtre et le `journalmatch` sont
@@ -165,6 +180,19 @@ tail -f /var/log/fail2ban.log
 - **Port SSH injoignable** : pensez au pare-feu de l'hébergeur (Security Group AWS/Azure/GCP,
   pare-feu réseau OVH, Scaleway, Hetzner…), le script ne gère que le pare-feu local.
 - **Amazon Linux 2023** : pas d'EPEL officiel, Fail2ban peut y être indisponible.
+
+## Tests
+
+Tests d'intégration en conteneurs jetables (podman ou docker, systemd/OpenRC réels) :
+
+```bash
+tests/integration/run.sh            # Debian 13, Rocky 9, Alpine 3.22
+tests/integration/run.sh debian13   # une seule distribution
+```
+
+Ils couvrent : refus hyperviseur et `--force-hypervisor`, installation non interactive,
+Postfix TLS strict, `--no-report`, retour arrière SSH (SIGKILL de l'installateur, coupure de
+session, confirmation, mode non interactif) et restauration de la récidive.
 
 ## Désinstallation
 

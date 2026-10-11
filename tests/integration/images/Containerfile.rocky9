@@ -1,0 +1,6 @@
+FROM docker.io/library/rockylinux:9
+RUN dnf -y -q install systemd openssh-server python3 iproute procps-ng util-linux \
+      ca-certificates policycoreutils-python-utils findutils && \
+    ssh-keygen -A && systemctl enable sshd && dnf clean all
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

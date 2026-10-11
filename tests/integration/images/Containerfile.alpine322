@@ -1,0 +1,7 @@
+FROM docker.io/library/alpine:3.22
+RUN apk add -q --no-cache openrc busybox-openrc openssh bash python3 iproute2 procps util-linux-misc \
+      ca-certificates coreutils findutils grep sed && \
+    sed -i 's/^#\?rc_sys=.*/rc_sys="docker"/' /etc/rc.conf && \
+    ssh-keygen -A && rc-update add sshd default && rc-update add syslog default && \
+    mkdir -p /run/openrc && touch /run/openrc/softlevel
+CMD ["/sbin/init"]
