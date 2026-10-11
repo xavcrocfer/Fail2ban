@@ -8,7 +8,9 @@ set -Euo pipefail
 NEW=2222
 fail() { echo "ÉCHEC : $*" >&2; journalctl -n 30 --no-pager >&2 2>/dev/null || true; exit 1; }
 ok() { echo "OK : $*"; }
-listening() { ss -Hltn "sport = :$1" | grep -q LISTEN; }
+# Jamais « ss … | grep -q » : grep quitte à la 1re ligne, ss (IPv4 puis IPv6) reçoit
+# SIGPIPE et pipefail rend le test faux alors que le port écoute (échec intermittent)
+listening() { [[ $(ss -Hltn "sport = :$1") == *LISTEN* ]]; }
 effective_ports() { sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -n | xargs; }
 command -v script >/dev/null || fail "util-linux « script » requis"
 # systemd (timer transitoire) ou OpenRC/autre (processus détaché setsid)
