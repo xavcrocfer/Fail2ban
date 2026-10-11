@@ -11,11 +11,14 @@ S=/src/setup.sh
 if [[ -d /run/systemd/system ]]; then
     f2b_active() { systemctl is-active --quiet fail2ban; }
     report_scheduled() { systemctl is-enabled --quiet fail2ban-report.timer; }
+    report_calendar() { sed -n 's/^OnCalendar=//p' /etc/systemd/system/fail2ban-report.timer; }
     report_gone() { [[ ! -e /etc/systemd/system/fail2ban-report.timer ]] && ! systemctl is-active --quiet fail2ban-report.timer; }
 else
     f2b_active() { rc-service fail2ban status >/dev/null 2>&1; }
     report_scheduled() { grep -qs fail2ban-report /etc/crontabs/root /etc/cron.d/fail2ban-report; }
     report_gone() { ! report_scheduled; }
+    # « mm hh jour mois jsem » de la ligne cron
+    report_calendar() { grep -hs fail2ban-report /etc/crontabs/root /etc/cron.d/fail2ban-report | grep -v '^#' | awk '{print $1, $2, $3, $4, $5}'; }
 fi
 COMMON=(-y --keep-ssh-port --ignore-ip 10.0.0.0/8)
 
@@ -50,14 +53,42 @@ pc() { postconf -h "$1"; }
 grep -rq 's3cret-test' /var/log/ 2>/dev/null && fail "mot de passe SMTP présent dans un journal"
 ok "Postfix : TLS secure (certificat vérifié), SASL sans clair, secret absent des journaux"
 report_scheduled || fail "rapport non planifié"
-ok "rapport hebdomadaire planifié"
+conf=/etc/fail2ban/report.conf
+# Conteneur sur réseau privé (10.88.x / 10.0.2.x) : profil LAN → rapport mensuel le 1er
+grep -q '^HOST_PROFILE="lan"' $conf || fail "profil lan attendu ($(grep HOST_PROFILE $conf))"
+grep -q '^REPORT_PERIOD="month"' $conf || fail "période month attendue"
+grep -q '^REPORT_STATE="/var/lib/fail2ban-setup/report-state.json"' $conf || fail "REPORT_STATE absent"
+cal=$(report_calendar)
+[[ $cal == "*-*-01 08:00:00" || $cal == "0 8 1 * *" ]] || fail "planification mensuelle attendue (« ${cal} »)"
+grep -q "le 1er de chaque mois" /tmp/inst.log || fail "résumé mensuel absent"
+ok "profil LAN détecté → rapport mensuel le 1er (${cal})"
+[[ ! -e /var/lib/fail2ban-setup/report-state.json ]] || fail "l'aperçu (--until-now) ne doit pas mémoriser l'état"
+fail2ban-report --stdout --no-geoip --save-state >/tmp/rep.txt 2>&1 || fail "fail2ban-report : code $?"
+grep -q "NOUVEAUTÉS" /tmp/rep.txt || fail "section Nouveautés absente"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["version"]==1 and d["profile"]=="lan", d' \
+    /var/lib/fail2ban-setup/report-state.json || fail "état du rapport invalide"
+[[ $(stat -c %a /var/lib/fail2ban-setup/report-state.json) == 600 ]] || fail "état non protégé (600 attendu)"
+fail2ban-report --stdout --no-geoip >/tmp/rep2.txt 2>&1 || fail "2e rapport : code $?"
+grep -q "Rien de nouveau\|déjà bannie" /tmp/rep2.txt || fail "2e rapport : delta non calculé"
+ok "rapport : section Nouveautés, état mémorisé (600), delta au 2e passage"
 
 # 3. Port 25 : TLS toujours obligatoire (plus d'opportuniste « may »)
 SMTP_PASSWORD='s3cret-test' bash "$S" "${COMMON[@]}" --email admin@example.org \
     --smtp-host smtp.example.org --smtp-port 25 --smtp-user alert@example.org --smtp-tls encrypt \
+    --profile vps --report-period week --report-day mar \
     >/tmp/inst25.log 2>&1 || fail "réinstallation port 25 : code $?"
 [[ $(pc smtp_tls_security_level) == encrypt ]] || fail "port 25 : encrypt attendu ($(pc smtp_tls_security_level))"
 ok "port 25 + --smtp-tls encrypt → TLS obligatoire (jamais « may »)"
+grep -q '^HOST_PROFILE="vps"' $conf && grep -q '^REPORT_PERIOD="days"' $conf || fail "--profile vps / week non appliqués"
+cal=$(report_calendar)
+[[ $cal == "Tue *-*-* 08:00:00" || $cal == "0 8 * * 2" ]] || fail "planification hebdo mardi attendue (« ${cal} »)"
+grep -q '^HOST_PROFILE=vps' /var/lib/fail2ban-setup/answers.env || fail "profil non mémorisé"
+ok "--profile vps --report-period week --report-day mar → mardi 08:00 (${cal}), mémorisé"
+bash "$S" -y --profile dmz >/dev/null 2>&1 && fail "--profile dmz doit être refusé"
+bash "$S" -y --report-period daily >/dev/null 2>&1 && fail "--report-period daily doit être refusé"
+det=$(bash "$S" --detect 2>&1)  # pas de « | grep -q » : SIGPIPE sous pipefail
+[[ $det == *"Profil détecté"*lan* ]] || fail "--detect : profil détecté absent"
+ok "options invalides refusées ; --detect affiche le profil détecté"
 bash "$S" -y --smtp-tls may >/dev/null 2>&1 && fail "--smtp-tls may doit être refusé"
 ok "--smtp-tls may refusé"
 

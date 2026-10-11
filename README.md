@@ -1,7 +1,8 @@
 # Fail2ban Setup
 
 Script d'installation et de configuration **multi-distribution** de Fail2ban, orienté
-protection SSH, avec **rapport hebdomadaire des bans par email**.
+protection SSH, avec **rapport périodique des bans par email** (hebdomadaire sur un VPS,
+mensuel sur un réseau interne) qui met en avant **ce qui a changé** depuis l'envoi précédent.
 
 ```bash
 sudo ./setup.sh            # interactif
@@ -26,9 +27,15 @@ sudo ./setup.sh --help     # toutes les options
   systemd) : il a lieu même si l'installateur est tué ou la session SSH coupée.
 - **Refus des hyperviseurs** : Proxmox VE, hôte KVM/libvirt, Xen dom0, LXD/Incus, VirtualBox
   hôte → arrêt (code 3) avant toute modification. Les VM et VPS invités restent pris en charge.
-- **Rapport hebdomadaire HTML + texte** (timer systemd ou cron) : bans par jour, par jail,
-  top des IP avec pays, réseaux /24 les plus actifs, récidives, comparaison avec la période
-  précédente, alertes si une jail est tombée.
+- **Profil VPS / LAN détecté automatiquement** (adresse IPv4 publique, fournisseur cloud,
+  session SSH depuis Internet ; sans requête réseau) — modifiable avec `--profile`.
+- **Rapport HTML + texte** (timer systemd ou cron), hebdomadaire en VPS, mensuel (le 1er) en
+  LAN : bans par jour, par jail, top des IP avec pays, réseaux /24 les plus actifs, récidives,
+  comparaison avec la période précédente, alertes si une jail est tombée.
+- **Section « Nouveautés »** : grâce à une mémoire entre deux rapports, seules les évolutions
+  ressortent — jail disparue/ajoutée, nouveau pays, nouveau réseau actif, IP qui reviennent.
+- **Profil LAN** : tout ban d'une IP interne (RFC 1918, CGNAT, ULA…) est signalé comme
+  anomalie (poste compromis, scan interne, liste blanche incomplète).
 - **Email à chaque récidive** (en français, avec extrait whois).
 - **Relais SMTP authentifié via Postfix** (Gmail, OVH, Office 365, Brevo…) avec email de test
   et contrôle de la file d'attente. **TLS toujours obligatoire** (y compris port 25) et
@@ -85,7 +92,9 @@ sudo SMTP_PASSWORD='mot-de-passe' ./setup.sh -y \
 | `--email`, `--from` | destinataire(s) / expéditeur |
 | `--smtp-host`, `--smtp-port`, `--smtp-user` | relais Postfix (mot de passe : `SMTP_PASSWORD`) |
 | `--smtp-tls NIVEAU` | `secure` (défaut : TLS + certificat vérifié) ou `encrypt` (relais interne auto-signé) |
-| `--report-day`, `--report-time` | planification (défaut : lundi 08:00) |
+| `--profile vps\|lan` | profil de la machine (défaut : détecté) |
+| `--report-period week\|month` | rapport hebdomadaire ou mensuel le 1er (défaut : week en VPS, month en LAN) |
+| `--report-day`, `--report-time` | jour (hebdo) et heure (défaut : lundi 08:00) |
 | `--no-report`, `--no-recidive-mail` | pas de rapport (retire aussi une planification existante) / pas d'email de récidive |
 | `--force-hypervisor` | installer malgré la détection d'un hyperviseur (déconseillé) |
 | `--detect` | afficher la détection et quitter |
@@ -117,7 +126,8 @@ régénérés à chaque exécution (personnalisations → `jail.d/99-local.local
 | `/etc/fail2ban/action.d/mail-recidive.conf` | email de récidive |
 | `/usr/local/sbin/fail2ban-recidive-restore` | restauration du compteur de récidive |
 | `/etc/systemd/system/fail2ban.service.d/50-fail2ban-setup-recidive.conf` | lancement de la restauration au démarrage |
-| `/usr/local/sbin/fail2ban-report` + `/etc/fail2ban/report.conf` | rapport hebdomadaire |
+| `/usr/local/sbin/fail2ban-report` + `/etc/fail2ban/report.conf` | rapport périodique |
+| `/var/lib/fail2ban-setup/report-state.json` | mémoire du rapport (nouveautés), mode 600 |
 | `/etc/systemd/system/fail2ban-report.{service,timer}` (ou cron) | planification |
 | `/etc/ssh/sshd_config.d/00-fail2ban-setup-port.conf` | port SSH (si modifié) |
 
@@ -148,14 +158,24 @@ Journal : `/var/log/fail2ban-setup.log` — sauvegardes : `/var/backups/fail2ban
 - **Action de ban** : `firewallcmd-*` si firewalld est actif, sinon `nftables` (table dédiée
   qui coexiste avec ufw/iptables-nft), sinon `iptables`.
 
-## Rapport hebdomadaire
+## Rapport
 
 ```bash
 fail2ban-report --stdout --until-now   # aperçu texte, inclut aujourd'hui
 fail2ban-report --html /tmp/r.html     # version HTML
 fail2ban-report --days 30 --to moi@exemple.fr
+fail2ban-report --period month --stdout  # mois calendaire précédent
+fail2ban-report --profile lan --stdout   # forcer le profil
 systemctl list-timers fail2ban-report  # prochaine exécution
 ```
+
+**Mémoire entre rapports.** Après chaque envoi réussi, `fail2ban-report` enregistre dans
+`/var/lib/fail2ban-setup/report-state.json` (écriture atomique, root seul) les IP de la période,
+les réseaux /24 et pays déjà vus et la liste des jails. Le rapport suivant en déduit la section
+« Nouveautés ». Un aperçu (`--stdout`, `--html`, `--until-now`) ne modifie **jamais** cette
+référence, sauf avec `--save-state` ; `--no-state` l'ignore complètement. Un fichier absent ou
+corrompu est simplement ignoré (le rapport l'indique comme « premier rapport »).
+Les pays déjà résolus y sont mis en cache, ce qui évite de relancer `whois` à chaque rapport.
 
 Les données viennent de la base SQLite de Fail2ban (90 jours d'historique) et de
 `fail2ban-client`. Le pays des IP est obtenu par `whois` (désactivable : `REPORT_GEOIP=no`).
@@ -191,8 +211,18 @@ tests/integration/run.sh debian13   # une seule distribution
 ```
 
 Ils couvrent : refus hyperviseur et `--force-hypervisor`, installation non interactive,
-Postfix TLS strict, `--no-report`, retour arrière SSH (SIGKILL de l'installateur, coupure de
-session, confirmation, mode non interactif) et restauration de la récidive.
+Postfix TLS strict, `--no-report`, profil LAN/VPS et planification hebdo/mensuelle, mémoire
+du rapport, retour arrière SSH (SIGKILL de l'installateur, coupure de session, confirmation,
+mode non interactif) et restauration de la récidive.
+
+Les scripts Python installés vivent dans `scripts/` (source de vérité, testables
+directement) et sont **embarqués** dans `setup.sh`, qui reste un fichier unique autonome :
+
+```bash
+python3 -m unittest discover -s tests/unit -v   # tests unitaires du rapport (sans fail2ban)
+scripts/embed.py            # recopie scripts/*.py dans setup.sh après modification
+scripts/embed.py --check    # échoue si setup.sh n'est pas synchronisé
+```
 
 ## Désinstallation
 
