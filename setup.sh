@@ -21,7 +21,8 @@
 #          [sshd]           5 échecs en 1 h          → ban 24 h
 #          [sshd-recidive]  3 bans [sshd] en 30 j    → ban 60 j, tous ports
 #     4. Configure (option) Postfix en relais SMTP authentifié.
-#     5. Installe un rapport hebdomadaire HTML des bans (timer systemd / cron).
+#     5. Installe un rapport HTML des bans (hebdomadaire en VPS, mensuel en LAN),
+#        avec mémoire des nouveautés d'un envoi à l'autre (timer systemd / cron).
 #
 #   Le script est idempotent : il peut être relancé pour modifier la config,
 #   les réponses précédentes sont proposées par défaut.
@@ -45,7 +46,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 #===============================================================================
 # 1. CONSTANTES & PARAMÈTRES
 #===============================================================================
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.3.0"
 readonly SCRIPT_NAME="fail2ban-setup"
 readonly MANAGED_MARK="Géré par ${SCRIPT_NAME}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
@@ -61,7 +62,7 @@ readonly F2B_ACTION_MAIL="${F2B_ETC}/action.d/mail-recidive.conf"
 readonly F2B_LOG="/var/log/fail2ban.log"
 readonly RESTORE_BIN="/usr/local/sbin/fail2ban-recidive-restore"
 
-# Rapport hebdomadaire
+# Rapport périodique
 readonly REPORT_BIN="/usr/local/sbin/fail2ban-report"
 readonly REPORT_CONF="${F2B_ETC}/report.conf"
 readonly REPORT_UNIT="fail2ban-report"
@@ -79,6 +80,8 @@ SSH_RB_GRACE=${SSH_RB_GRACE:-120}
 # Fonctionnement du script
 readonly STATE_DIR="/var/lib/${SCRIPT_NAME}"
 readonly STATE_FILE="${STATE_DIR}/answers.env"
+# Mémoire du rapport (nouveautés d'un envoi à l'autre)
+readonly REPORT_STATE_FILE="${STATE_DIR}/report-state.json"
 readonly BACKUP_ROOT="/var/backups/${SCRIPT_NAME}"
 readonly BACKUP_DIR="${BACKUP_ROOT}/${RUN_ID}"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
@@ -110,6 +113,7 @@ OPT_REPORT_DAY=""
 OPT_REPORT_TIME=""
 OPT_RECIDIVE_MAIL=true
 OPT_FORCE_HYPERVISOR=false
+OPT_PROFILE="" OPT_REPORT_PERIOD=""
 ORIG_ARGS="$*"
 
 # --- État détecté / décidé pendant l'exécution ----------------------------------
@@ -130,6 +134,8 @@ PYTHON_BIN=""
 F2B_BACKEND="auto" SSH_LOGPATH="" SSH_FILTER_EXTRA=""
 IGNORE_EXTRA="" IGNORE_IPS=""
 REPORT_ENABLED=false REPORT_TO="" REPORT_FROM="" REPORT_DAY="mon" REPORT_TIME="08:00"
+# Profil : vps (exposé à Internet) | lan (réseau interne) ; période : week | month
+HOST_PROFILE="" PROFILE_REASON="" REPORT_PERIOD="week"
 MAIL_MODE="none"                 # relay | existing | none
 SMTP_HOST="" SMTP_PORT="587" SMTP_USER="" SMTP_PASSWORD="${SMTP_PASSWORD:-}"
 # secure = TLS obligatoire + vérification du certificat (défaut) ;
@@ -143,6 +149,7 @@ TMP_FILES=()
 
 # Réponses de l'exécution précédente (valeurs par défaut des questions)
 PREV_IGNORE_IPS="" PREV_REPORT_TO="" PREV_REPORT_FROM="" PREV_REPORT_DAY="" PREV_REPORT_TIME=""
+PREV_HOST_PROFILE="" PREV_REPORT_PERIOD=""
 PREV_SMTP_HOST="" PREV_SMTP_PORT="" PREV_SMTP_USER="" PREV_SMTP_TLS_LEVEL=""
 
 # Retour arrière SSH
@@ -225,16 +232,21 @@ Installation
       --keep-ssh-port           Ne propose jamais de changer le port SSH
       --ssh-mode MODE           Mode du filtre sshd : normal|ddos|extra|aggressive
       --ignore-ip "IP …"        IP/CIDR à ne jamais bannir (en plus de localhost)
-      --email ADRESSE[,…]       Destinataire(s) du rapport hebdomadaire
+      --email ADRESSE[,…]       Destinataire(s) du rapport
       --from ADRESSE            Expéditeur des emails
       --smtp-host HÔTE          Configure Postfix en relais via HÔTE
       --smtp-port PORT          Port du relais (défaut 587 ; 465 = TLS implicite)
       --smtp-user IDENTIFIANT   Compte SMTP (mot de passe : variable SMTP_PASSWORD)
-      --report-day JOUR         Jour du rapport : lun…dim / mon…sun (défaut lun)
+      --profile vps|lan         Profil de la machine (défaut : détecté — vps si une
+                                adresse IPv4 publique ou un cloud est détecté)
+      --report-period week|month
+                                Rapport hebdomadaire ou mensuel (le 1er du mois)
+                                (défaut : week en VPS, month en LAN)
+      --report-day JOUR         Jour du rapport hebdomadaire : lun…dim / mon…sun
       --report-time HH:MM       Heure du rapport (défaut 08:00)
       --smtp-tls NIVEAU         secure (défaut : TLS + certificat vérifié) | encrypt
                                 (TLS sans vérification, relais interne auto-signé)
-      --no-report               Pas de rapport hebdomadaire ; DÉSACTIVE et retire
+      --no-report               Pas de rapport ; DÉSACTIVE et retire
                                 une planification déjà installée par ce script
       --no-recidive-mail        Pas d'email à chaque ban de récidive
 
@@ -340,6 +352,26 @@ is_hostname()   { [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; }
 is_hhmm()       { [[ $1 =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 is_ssh_mode()   { [[ $1 =~ ^(normal|ddos|extra|aggressive)$ ]]; }
 is_day()        { [[ -n $(normalize_day "$1") ]]; }
+is_profile()    { [[ $1 == vps || $1 == lan ]]; }
+# week|month (+ alias français) → week|month, vide si invalide
+normalize_period() {
+    case ${1,,} in
+        week | weekly | hebdo | hebdomadaire | semaine) echo week ;;
+        month | monthly | mensuel | mois) echo month ;;
+    esac
+}
+is_period()     { [[ -n $(normalize_period "$1") ]]; }
+# Adresse d'un réseau interne : RFC 1918, CGNAT, lien local, boucle, ULA IPv6
+is_internal_ip() {
+    local ip=${1#::ffff:} a b
+    if [[ $ip == *:* ]]; then
+        case ${ip,,} in fc* | fd* | fe[89ab]* | ::1) return 0 ;; *) return 1 ;; esac
+    fi
+    IFS=. read -r a b _ <<<"$ip"
+    [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]] || return 1
+    ((a == 10 || a == 127 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) ||
+        (a == 100 && b >= 64 && b <= 127) || (a == 169 && b == 254)))
+}
 
 is_email_list() {
     local IFS=$', \t' e n=0
@@ -743,6 +775,37 @@ detect_admin_ip() {
     return 0
 }
 
+# Profil : « vps » si la machine est exposée à Internet, « lan » sinon.
+# Indices, du plus fiable au moins fiable (aucune requête réseau sortante) :
+#   1. adresse IPv4 publique portée par une interface ;
+#   2. fournisseur cloud dans la DMI (IP privée derrière NAT 1:1 : AWS, GCP…) ;
+#   3. session SSH de l'administrateur venant d'une IP publique.
+# L'IPv6 globale seule ne suffit pas : un LAN domestique en a souvent derrière
+# le pare-feu de sa box. --profile (ou la réponse précédente) prime.
+detect_profile() {
+    local a vendor
+    HOST_PROFILE="" PROFILE_REASON=""
+    while read -r a; do
+        a=${a%/*}
+        if [[ -n $a ]] && ! is_internal_ip "$a"; then
+            HOST_PROFILE=vps PROFILE_REASON="adresse publique ${a}"
+            return 0
+        fi
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}')
+    vendor=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/board_vendor 2>/dev/null | tr '\n' ' ' || true)
+    case ${vendor,,} in
+        *amazon* | *google* | *digitalocean* | *hetzner* | *scaleway* | *linode* | *akamai* | *vultr* | *alibaba* | *upcloud*)
+            HOST_PROFILE=vps PROFILE_REASON="fournisseur cloud (${vendor% })"
+            return 0
+            ;;
+    esac
+    if [[ -n $ADMIN_IP ]] && ! is_internal_ip "$ADMIN_IP"; then
+        HOST_PROFILE=vps PROFILE_REASON="session SSH depuis l'IP publique ${ADMIN_IP}"
+        return 0
+    fi
+    HOST_PROFILE=lan PROFILE_REASON="aucune adresse publique (réseau interne)"
+}
+
 # Hyperviseur (HÔTE de virtualisation) : le script refuse de s'y installer.
 # Les invités (VM, VPS) restent couverts ; seule l'information est affichée.
 # Raisons : SSH/pare-feu/Postfix d'un hyperviseur sont gérés par sa propre pile
@@ -823,6 +886,7 @@ detect_all() {
     detect_mta
     detect_admin_ip
     detect_hypervisor
+    detect_profile
     HOST_FQDN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || uname -n)
     [[ -n $HOST_FQDN && $HOST_FQDN != "(none)" ]] || HOST_FQDN=$(uname -n)
     HOST_SHORT=${HOST_FQDN%%.*}
@@ -837,6 +901,7 @@ detect_all() {
     kv "Pare-feu" "$fw_desc"
     kv "Action de ban" "${BANACTION} / ${BANACTION_ALLPORTS}"
     kv "SELinux" "$SELINUX_MODE"
+    kv "Profil détecté" "${HOST_PROFILE} — ${PROFILE_REASON}"
     if [[ -n $HYPERVISOR ]]; then
         kv "Virtualisation" "HYPERVISEUR ${HYPERVISOR} (${HYPERVISOR_EVIDENCE}) → exclu"
     else
@@ -1107,7 +1172,7 @@ load_previous_answers() {
     local k v
     while IFS='=' read -r k v; do
         case $k in
-            IGNORE_IPS | REPORT_TO | REPORT_FROM | REPORT_DAY | REPORT_TIME | SMTP_HOST | SMTP_PORT | SMTP_USER | SMTP_TLS_LEVEL)
+            IGNORE_IPS | REPORT_TO | REPORT_FROM | REPORT_DAY | REPORT_TIME | SMTP_HOST | SMTP_PORT | SMTP_USER | SMTP_TLS_LEVEL | HOST_PROFILE | REPORT_PERIOD)
                 printf -v "PREV_${k}" '%s' "$v"
                 ;;
         esac
@@ -1129,6 +1194,8 @@ SMTP_HOST=${SMTP_HOST}
 SMTP_PORT=${SMTP_PORT}
 SMTP_USER=${SMTP_USER}
 SMTP_TLS_LEVEL=${SMTP_TLS_LEVEL}
+HOST_PROFILE=${HOST_PROFILE}
+REPORT_PERIOD=${REPORT_PERIOD}
 EOF
 }
 
@@ -1248,16 +1315,24 @@ questions_report() {
     fi
     local def_to=${OPT_EMAIL:-$PREV_REPORT_TO} def_from day
     if [[ -z $def_to ]] && ! has_tty; then
-        log_warn "Aucune adresse (--email) : rapport hebdomadaire non installé."
+        log_warn "Aucune adresse (--email) : rapport non installé."
         return 0
     fi
-    ask_yn "Installer le rapport hebdomadaire des bans par email ?" o || return 0
+    ask_yn "Installer le rapport des bans par email ?" o || return 0
     REPORT_ENABLED=true
 
     ask REPORT_TO "Destinataire(s) du rapport (séparés par des virgules)" "$def_to" is_email_list
     REPORT_TO=$(tr -s ' ,;' ',' <<<"$REPORT_TO" | sed 's/^,//; s/,$//')
-    ask day "Jour d'envoi (lun…dim)" "$(day_fr "$(normalize_day "${OPT_REPORT_DAY:-${PREV_REPORT_DAY:-mon}}")")" is_day
-    REPORT_DAY=$(normalize_day "$day")
+    # VPS : hebdomadaire (exposition permanente) ; LAN : mensuel (bruit de fond faible)
+    local period def_period=week
+    [[ $HOST_PROFILE == lan ]] && def_period=month
+    ask period "Fréquence du rapport (week = hebdomadaire, month = mensuel le 1er)" \
+        "${OPT_REPORT_PERIOD:-${PREV_REPORT_PERIOD:-$def_period}}" is_period
+    REPORT_PERIOD=$(normalize_period "$period")
+    if [[ $REPORT_PERIOD == week ]]; then
+        ask day "Jour d'envoi (lun…dim)" "$(day_fr "$(normalize_day "${OPT_REPORT_DAY:-${PREV_REPORT_DAY:-mon}}")")" is_day
+        REPORT_DAY=$(normalize_day "$day")
+    fi
     ask REPORT_TIME "Heure d'envoi (HH:MM)" "${OPT_REPORT_TIME:-${PREV_REPORT_TIME:-08:00}}" is_hhmm
     REPORT_TIME=$(printf '%02d:%02d' "$((10#${REPORT_TIME%%:*}))" "$((10#${REPORT_TIME##*:}))")
 
@@ -1274,11 +1349,31 @@ questions_report() {
     ask REPORT_FROM "Adresse expéditrice" "$def_from" is_email_loose
 }
 
+# --profile > réponse précédente > détection ; confirmé en interactif
+questions_profile() {
+    local def=${OPT_PROFILE:-${PREV_HOST_PROFILE:-$HOST_PROFILE}}
+    [[ -n $OPT_PROFILE ]] && PROFILE_REASON="--profile"
+    [[ -z $OPT_PROFILE && -n $PREV_HOST_PROFILE && $PREV_HOST_PROFILE != "$HOST_PROFILE" ]] &&
+        PROFILE_REASON="choix de l'exécution précédente (détecté : ${HOST_PROFILE})"
+    ask HOST_PROFILE "Profil de la machine (vps = exposée à Internet, lan = réseau interne)" "$def" is_profile
+    [[ $HOST_PROFILE == "$def" ]] || PROFILE_REASON="choisi interactivement"
+}
+
 questions() {
     log_step "Configuration"
+    questions_profile
     questions_ssh_port
     questions_ignoreip
     questions_report
+}
+
+# « chaque lundi à 08:00 » / « le 1er de chaque mois à 08:00 »
+report_when() {
+    if [[ $REPORT_PERIOD == month ]]; then
+        echo "le 1er de chaque mois à ${REPORT_TIME}"
+    else
+        echo "chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME}"
+    fi
 }
 
 validate_parameters() {
@@ -1307,7 +1402,7 @@ show_plan() {
         ssh_desc="port ${SSH_FINAL_PORTS} (inchangé)"
     fi
     if [[ $REPORT_ENABLED == true ]]; then
-        rep_desc="chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME} → ${REPORT_TO}"
+        rep_desc="$(report_when) → ${REPORT_TO}"
         case $MAIL_MODE in
             relay) mail_desc="Postfix → relais [${SMTP_HOST}]:${SMTP_PORT}, TLS ${SMTP_TLS_LEVEL}${SMTP_USER:+ (compte ${SMTP_USER})}" ;;
             existing) mail_desc="MTA existant (${MTA_NAME})" ;;
@@ -1323,7 +1418,8 @@ show_plan() {
     kv "Jail sshd-recidive" "${RECIDIVE_MAXRETRY} bans sshd / ${RECIDIVE_FINDTIME} → ban ${RECIDIVE_BANTIME}, tous ports"
     kv "Action de ban" "${BANACTION} / ${BANACTION_ALLPORTS}"
     kv "Liste blanche" "$IGNORE_IPS"
-    kv "Rapport hebdo" "$rep_desc"
+    kv "Profil" "${HOST_PROFILE} (${PROFILE_REASON})"
+    kv "Rapport" "$rep_desc"
     kv "Envoi des emails" "$mail_desc"
     if [[ $OPT_RECIDIVE_MAIL == true && $REPORT_ENABLED == true && $MAIL_MODE != none ]]; then
         kv "Notif. récidive" "oui (email à chaque ban de ${RECIDIVE_BANTIME})"
@@ -1354,7 +1450,7 @@ Auto-Submitted: auto-generated
 Bonjour,
 
 Ce message confirme que ${HOST_FQDN} sait envoyer des emails.
-Le rapport Fail2ban sera envoyé chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME}.
+Le rapport Fail2ban sera envoyé $(report_when).
 
 --
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
@@ -2307,6 +2403,12 @@ REPORT_FROM="${REPORT_FROM}"
 REPORT_FROM_NAME="Fail2ban ${HOST_SHORT}"
 REPORT_HOSTNAME="${HOST_FQDN}"
 REPORT_SUBJECT_PREFIX="[Fail2ban]"
+# Profil : vps (exposé à Internet) | lan (tout ban d'une IP interne = alerte)
+HOST_PROFILE="${HOST_PROFILE}"
+# Période : days (REPORT_DAYS derniers jours) | month (mois calendaire précédent)
+REPORT_PERIOD="$([[ $REPORT_PERIOD == month ]] && echo month || echo days)"
+# Mémoire entre deux rapports (section « Nouveautés »)
+REPORT_STATE="${REPORT_STATE_FILE}"
 # Période couverte (jours) et taille des classements
 REPORT_DAYS=7
 REPORT_TOP=10
@@ -2314,6 +2416,10 @@ REPORT_TOP=10
 REPORT_GEOIP=yes
 # Jails dont l'absence déclenche une alerte dans le rapport
 EXPECTED_JAILS="sshd sshd-recidive"
+# Contrôles de sécurité : yes | no | liste parmi ssh_logins sshd_config firewall
+# accounts database (connexions réussies, sshd -T, bans ↔ pare-feu, comptes visés,
+# santé de la base). Un contrôle en ALERTE remonte en tête du rapport.
+REPORT_CHECKS=yes
 # Détectés automatiquement si vides :
 F2B_DB=""
 SENDMAIL=""
@@ -2324,7 +2430,7 @@ gen_report_service() {
     managed_header
     cat <<EOF
 [Unit]
-Description=Rapport hebdomadaire Fail2ban (bans de la semaine par email)
+Description=Rapport Fail2ban (bans de la période par email)
 After=network-online.target fail2ban.service
 Wants=network-online.target
 
@@ -2338,14 +2444,14 @@ EOF
 }
 
 gen_report_timer() {
-    local dow=$1 hhmm=$2
+    local calendar=$1
     managed_header
     cat <<EOF
 [Unit]
-Description=Planification du rapport hebdomadaire Fail2ban
+Description=Planification du rapport Fail2ban
 
 [Timer]
-OnCalendar=${dow} *-*-* ${hhmm}:00
+OnCalendar=${calendar}
 RandomizedDelaySec=5min
 # Rattrape l'envoi si le serveur était éteint à l'heure prévue
 Persistent=true
@@ -2356,38 +2462,43 @@ EOF
 }
 
 install_report_schedule() {
-    local dow_sd dow_cron hh mm tab=/etc/crontabs/root tmp
-    dow_sd=${REPORT_DAY^}
-    dow_cron=$(day_cron "$REPORT_DAY")
+    local calendar cron_when hh mm tab=/etc/crontabs/root tmp
     hh=$((10#${REPORT_TIME%%:*}))
     mm=$((10#${REPORT_TIME##*:}))
+    if [[ $REPORT_PERIOD == month ]]; then
+        calendar="*-*-01 ${REPORT_TIME}:00"
+        cron_when="${mm} ${hh} 1 * *"
+    else
+        calendar="${REPORT_DAY^} *-*-* ${REPORT_TIME}:00"
+        cron_when="${mm} ${hh} * * $(day_cron "$REPORT_DAY")"
+    fi
 
     if [[ $INIT_SYSTEM == systemd ]]; then
         write_file "${SYSTEMD_DIR}/${REPORT_UNIT}.service" 0644 < <(gen_report_service)
-        write_file "${SYSTEMD_DIR}/${REPORT_UNIT}.timer" 0644 < <(gen_report_timer "$dow_sd" "$REPORT_TIME")
+        write_file "${SYSTEMD_DIR}/${REPORT_UNIT}.timer" 0644 < <(gen_report_timer "$calendar")
         run "systemd : rechargement" systemctl daemon-reload
         run "Activation du timer ${REPORT_UNIT}.timer" systemctl enable "${REPORT_UNIT}.timer"
         run "Démarrage du timer ${REPORT_UNIT}.timer" systemctl restart "${REPORT_UNIT}.timer"
         rm -f "$CRON_FILE"
-        log_ok "Timer systemd : chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME} (systemctl list-timers ${REPORT_UNIT})"
+        log_ok "Timer systemd : $(report_when) (systemctl list-timers ${REPORT_UNIT})"
     elif [[ $OS_FAMILY == alpine ]]; then
         backup_file "$tab"
         tmp=$(mktemp)
         TMP_FILES+=("$tmp")
         { grep -v 'fail2ban-report' "$tab" 2>/dev/null || true
-          printf '%d %d * * %s %s 2>&1 | logger -t fail2ban-report  # %s\n' \
-              "$mm" "$hh" "$dow_cron" "$REPORT_BIN" "$MANAGED_MARK"; } >"$tmp"
+          printf '%s %s 2>&1 | logger -t fail2ban-report  # %s\n' \
+              "$cron_when" "$REPORT_BIN" "$MANAGED_MARK"; } >"$tmp"
         cat "$tmp" >"$tab"
         svc_enable crond
-        log_ok "Crontab root : chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME}"
+        log_ok "Crontab root : $(report_when)"
     else
         write_file "$CRON_FILE" 0644 <<EOF
 $(managed_header)
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-${mm} ${hh} * * ${dow_cron} root ${REPORT_BIN} 2>&1 | logger -t fail2ban-report
+${cron_when} root ${REPORT_BIN} 2>&1 | logger -t fail2ban-report
 EOF
-        log_ok "Cron : chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME} (${CRON_FILE})"
+        log_ok "Cron : $(report_when) (${CRON_FILE})"
     fi
 }
 
@@ -2404,7 +2515,7 @@ report_schedule_present() {
 # --no-report : arrête réellement les envois (timer/cron) ; le générateur reste
 # disponible pour un usage manuel. Les fichiers retirés sont sauvegardés.
 remove_report_schedule() {
-    log_step "Désactivation du rapport hebdomadaire (--no-report)"
+    log_step "Désactivation du rapport (--no-report)"
     local f
     if [[ $INIT_SYSTEM == systemd ]]; then
         systemctl disable --now "${REPORT_UNIT}.timer" >>"$LOG_FILE" 2>&1 || true
@@ -2426,7 +2537,7 @@ remove_report_schedule() {
 }
 
 install_report() {
-    log_step "Rapport hebdomadaire des bans"
+    log_step "Rapport des bans"
     write_file "$REPORT_BIN" 0755 < <(gen_report_script)
     write_file "$REPORT_CONF" 0640 < <(gen_report_conf)
     install_report_schedule
@@ -2462,8 +2573,23 @@ gen_report_script() {
 #   fail2ban-report --stdout             affiche la version texte (n'envoie rien)
 #   fail2ban-report --html /tmp/r.html   écrit la version HTML (n'envoie rien)
 #   fail2ban-report --days 30 --to moi@exemple.fr --until-now
+#   fail2ban-report --period month       mois calendaire précédent
+#
+# Mémoire entre deux rapports (REPORT_STATE, JSON) : IP, réseaux, pays et jails du
+# rapport précédent → section « Nouveautés » qui ne montre que ce qui a changé.
+# Elle n'est mise à jour qu'après un envoi réussi (ou avec --save-state), jamais
+# par un aperçu (--stdout, --html, --until-now).
+#
+# Profil (HOST_PROFILE) : « vps » (exposé à Internet) ou « lan » (réseau interne).
+# En LAN, tout ban d'une IP interne est une anomalie et déclenche une alerte.
+#
+# Contrôles de sécurité (REPORT_CHECKS, --checks / --no-checks) : connexions SSH
+# réussies (IP bannie, source jamais vue, mot de passe, Internet en LAN), « sshd -T »
+# (root, mots de passe, ports ↔ jail), bans actifs absents du pare-feu, comptes
+# visés, santé de la base. Un contrôle en ALERTE remonte en tête du rapport.
 #
 import argparse
+import calendar
 import collections
 import datetime as dt
 import html
@@ -2476,6 +2602,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
@@ -2484,6 +2611,12 @@ from urllib.parse import quote
 
 DEFAULT_CONF = "/etc/fail2ban/report.conf"
 DEFAULT_DB = "/var/lib/fail2ban/fail2ban.sqlite3"
+DEFAULT_STATE = "/var/lib/fail2ban-setup/report-state.json"
+STATE_VERSION = 1
+STATE_MAX_ITEMS = 5000          # plafond par liste/dictionnaire mémorisé
+PROFILES = ("vps", "lan")
+MONTHS = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
+          "septembre", "octobre", "novembre", "décembre")
 WEEKDAYS = ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim.")
 WHOIS_COUNTRY = re.compile(r"^\s*country(?:-?code)?\s*:\s*([A-Za-z]{2})\b", re.I | re.M)
 
@@ -2591,6 +2724,64 @@ def network_of(ip):
     return str(ipaddress.ip_network("{}/{}".format(addr, prefix), strict=False))
 
 
+# Réseaux internes : RFC 1918, CGNAT, lien local, boucle locale, ULA IPv6.
+# Liste explicite : is_global/is_private rangent aussi les plages de documentation
+# (192.0.2.0/24, 203.0.113.0/24…) dans le « non global ».
+INTERNAL_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+    "169.254.0.0/16", "127.0.0.0/8", "fc00::/7", "fe80::/10", "::1/128"))
+
+
+def is_internal(ip):
+    """IP d'un réseau interne (voir INTERNAL_NETS)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return any(addr in net for net in INTERNAL_NETS if net.version == addr.version)
+
+
+def load_state(path):
+    """État du rapport précédent, ou None (absent, illisible, autre version)."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        warn("état {} illisible ({}) : ignoré".format(path, exc))
+        return None
+    if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+        warn("état {} d'un format inconnu : ignoré".format(path))
+        return None
+    return data
+
+
+def save_state(path, data):
+    """Écriture atomique (fichier temporaire + rename), lisible par root seul."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".report-state.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def capped(items, limit=STATE_MAX_ITEMS):
+    return sorted(items)[:limit]
+
+
 def whois_country(ip):
     exe = shutil.which("whois")
     if not exe:
@@ -2681,13 +2872,580 @@ def jails_status():
     return status
 
 
+# ----------------------------------------------------------------- contrôles
+# Niveau 1 : contrôles locaux, sans dépendance ni requête réseau. Chaque source
+# système (journaux, sshd -T, pare-feu, comptes) est une fonction de module que
+# les tests remplacent. Un contrôle qui plante devient un « INFO » : il ne doit
+# jamais empêcher l'envoi du rapport.
+# headline : phrase reprise en tête du rapport quand le contrôle est en ALERTE
+Check = collections.namedtuple("Check", "key level title summary lines headline")
+LEVELS = ("ok", "info", "warn", "alert")
+LEVEL_LABELS = {"ok": "OK", "info": "INFO", "warn": "ATTENTION", "alert": "ALERTE"}
+CHECK_KEYS = ("ssh_logins", "sshd_config", "firewall", "accounts", "database")
+CHECK_TITLES = {
+    "ssh_logins": "Connexions SSH réussies",
+    "sshd_config": "Configuration effective de sshd",
+    "firewall": "Cohérence Fail2ban ↔ pare-feu",
+    "accounts": "Comptes visés par les attaques",
+    "database": "Base de données Fail2ban",
+}
+AUTH_LOGS = ("/var/log/auth.log", "/var/log/secure", "/var/log/messages")
+SSH_ACCEPTED = re.compile(r"\bAccepted (\S+) for (\S+) from (\S+) port \d+")
+SSH_FAILED = re.compile(r"\bFailed (\S+) for (invalid user )?(\S+) from (\S+) port \d+")
+SSH_INVALID = re.compile(r"\bInvalid user (\S*) from (\S+)")
+SSH_PREAUTH = re.compile(r"\b(?:Connection closed by|Disconnected from) "
+                         r"(authenticating|invalid) user (\S+) (\S+) port \d+")
+SYSLOG_ISO = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:?\d\d)?\s+")
+SYSLOG_BSD = re.compile(r"^([A-Z][a-z]{2})\s+(\d{1,2}) (\d\d):(\d\d):(\d\d)\s+")
+BSD_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+PASSWORD_METHODS = ("password", "keyboard-interactive", "keyboard-interactive/pam")
+NO_LOGIN_SHELLS = ("nologin", "false", "sync", "shutdown", "halt")
+IP_TOKEN = re.compile(r"[0-9A-Fa-f:.]{2,}(?:/\d{1,3})?")
+DB_SIZE_WARN = 1 << 30
+
+
+def parse_syslog_ts(line, now=None):
+    """(horodatage, reste de la ligne) d'une ligne syslog RFC 3339 ou BSD, ou (None, line)."""
+    match = SYSLOG_ISO.match(line)
+    if match:
+        stamp, tz = match.group(1), match.group(2)
+        parsed = time.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+        if tz:
+            offset = 0
+            if tz != "Z":
+                offset = (int(tz[1:3]) * 3600 + int(tz[-2:]) * 60) * (1 if tz[0] == "+" else -1)
+            return calendar.timegm(parsed) - offset, line[match.end():]
+        return time.mktime(parsed), line[match.end():]
+    match = SYSLOG_BSD.match(line)
+    if match and match.group(1) in BSD_MONTHS:
+        now = now or time.time()
+        year = time.localtime(now).tm_year
+        fields = (BSD_MONTHS.index(match.group(1)) + 1, int(match.group(2)),
+                  int(match.group(3)), int(match.group(4)), int(match.group(5)))
+        try:
+            ts = time.mktime(dt.datetime(year, *fields).timetuple())
+            if ts > now + 86400:  # journal de décembre lu en janvier
+                ts = time.mktime(dt.datetime(year - 1, *fields).timetuple())
+        except ValueError:
+            return None, line
+        return ts, line[match.end():]
+    return None, line
+
+
+def find_exe(name):
+    return shutil.which(name) or next(
+        (p for p in ("/usr/sbin/" + name, "/sbin/" + name, "/usr/bin/" + name)
+         if os.access(p, os.X_OK)), None)
+
+
+def read_auth_lines(since, until):
+    """([(horodatage, ligne sshd)], source) de la période, ou (None, raison)."""
+    jctl = find_exe("journalctl")
+    if jctl and os.path.isdir("/run/systemd/system"):
+        # Facilités auth (4) et authpriv (10) : sshd, sshd-session, sshd-auth, PAM
+        out = run([jctl, "--no-pager", "-q", "-o", "short-unix",
+                   "--since", "@{}".format(int(since)), "--until", "@{}".format(int(until)),
+                   "SYSLOG_FACILITY=4", "SYSLOG_FACILITY=10"], timeout=120)
+        if out:
+            lines = []
+            for line in out.splitlines():
+                stamp, _, rest = line.partition(" ")
+                if "sshd" not in rest:
+                    continue
+                try:
+                    lines.append((float(stamp), rest))
+                except ValueError:
+                    continue
+            return lines, "journald"
+    lines, sources = [], []
+    for base in AUTH_LOGS:
+        for path in (base + ".1", base):  # rotation non compressée comprise
+            try:
+                if os.path.getmtime(path) < since:
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        if "sshd" not in line:
+                            continue
+                        ts, rest = parse_syslog_ts(line)
+                        if ts is not None and since <= ts < until:
+                            lines.append((ts, rest.rstrip("\n")))
+                sources.append(path)
+            except OSError:
+                continue
+        if sources:
+            break
+    if not sources:
+        return None, "aucun journal d'authentification lisible (journald, " + \
+            ", ".join(AUTH_LOGS) + ")"
+    return lines, ", ".join(sources)
+
+
+def parse_ssh_events(lines):
+    """Connexions réussies et noms d'utilisateur visés à partir des lignes sshd."""
+    accepted, targets, invalid = [], collections.defaultdict(set), set()
+    for ts, line in lines:
+        match = SSH_ACCEPTED.search(line)
+        if match:
+            accepted.append({"ts": ts, "method": match.group(1), "user": match.group(2),
+                             "ip": match.group(3)})
+            continue
+        match = SSH_FAILED.search(line)
+        if match:
+            targets[match.group(3)].add(match.group(4))
+            if match.group(2):
+                invalid.add(match.group(3))
+            continue
+        match = SSH_INVALID.search(line)
+        if match:
+            targets[match.group(1)].add(match.group(2))
+            invalid.add(match.group(1))
+            continue
+        match = SSH_PREAUTH.search(line)
+        if match:
+            targets[match.group(2)].add(match.group(3))
+            if match.group(1) == "invalid":
+                invalid.add(match.group(2))
+    return accepted, targets, invalid
+
+
+def parse_sshd_t(text):
+    """Sortie de « sshd -T » → dict (clés en minuscules ; ports = liste d'entiers)."""
+    conf, ports, listen_ports = {}, [], []
+    for line in text.splitlines():
+        key, _, value = line.strip().partition(" ")
+        key = key.lower()
+        if key == "port":
+            ports.append(int(value))
+        elif key == "listenaddress":
+            port = value.rpartition(":")[2]
+            if port.isdigit():
+                listen_ports.append(int(port))
+        elif key:
+            conf[key] = value.strip()
+    # ListenAddress avec port explicite prime sur Port
+    conf["ports"] = sorted(set(listen_ports or ports))
+    return conf
+
+
+def sshd_effective_config():
+    exe = find_exe("sshd")
+    if not exe:
+        return None
+    out = run([exe, "-T"])
+    if out is None:  # blocs Match : -T exige un contexte de connexion
+        out = run([exe, "-T", "-C", "user=root,host=localhost,addr=127.0.0.1"])
+    return parse_sshd_t(out) if out else None
+
+
+def resolve_ports(value):
+    """« ssh,2222 » / « 22:25 » / « all » → ensemble d'entiers, ou "all"."""
+    ports = set()
+    for token in re.split(r"[\s,]+", value or ""):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token in ("all", "any", "0:65535", "1:65535"):
+            return "all"
+        if ":" in token:
+            low, _, high = token.partition(":")
+            if low.isdigit() and high.isdigit():
+                ports.update(range(int(low), int(high) + 1))
+            continue
+        if token.isdigit():
+            ports.add(int(token))
+            continue
+        try:
+            ports.add(socket.getservbyname(token, "tcp"))
+        except OSError:
+            if token == "ssh":
+                ports.add(22)
+    return ports
+
+
+def jail_ports(jail="sshd", etc="/etc/fail2ban"):
+    """Ports surveillés par une jail, selon l'ordre de lecture de Fail2ban, ou None."""
+    import configparser
+    import glob
+    files = ([os.path.join(etc, "jail.conf")]
+             + sorted(glob.glob(os.path.join(etc, "jail.d", "*.conf")))
+             + [os.path.join(etc, "jail.local")]
+             + sorted(glob.glob(os.path.join(etc, "jail.d", "*.local"))))
+    port = default = None
+    for path in files:
+        # default_section neutralisé : [DEFAULT] devient une section ordinaire, ce qui
+        # distingue « port » propre à la jail de « port » hérité
+        parser = configparser.RawConfigParser(strict=False, default_section="\0",
+                                              inline_comment_prefixes=("#", ";"))
+        try:
+            if not parser.read(path, encoding="utf-8"):
+                continue
+        except (configparser.Error, UnicodeDecodeError):
+            continue
+        if parser.has_option(jail, "port"):
+            port = parser.get(jail, "port")
+        if parser.has_option("DEFAULT", "port"):
+            default = parser.get("DEFAULT", "port")
+    port = port or default
+    return resolve_ports(port) if port else None
+
+
+def firewall_dump():
+    """Texte des règles du pare-feu (nftables, iptables, ipset, hosts.deny), ou None.
+
+    None si aucun outil n'a pu être lu (absent, droits, netlink refusé) : sans
+    lecture réelle, impossible d'affirmer qu'un ban manque. hosts.deny seul ne
+    suffit pas à conclure, il ne fait que compléter.
+    """
+    parts, readable = [], False
+    for cmd in (["nft", "list", "ruleset"], ["iptables-save"], ["ip6tables-save"],
+                ["ipset", "list"]):
+        exe = find_exe(cmd[0])
+        if exe:
+            out = run([exe] + cmd[1:], timeout=60)
+            if out is not None:
+                readable = True
+                parts.append(out)
+    if not readable:
+        return None
+    try:
+        with open("/etc/hosts.deny", encoding="utf-8", errors="replace") as handle:
+            parts.append(handle.read())
+    except OSError:
+        pass
+    return "\n".join(parts)
+
+
+def addresses_in(text):
+    """Adresses (hôtes uniques, pas les réseaux) citées dans un texte de règles."""
+    found = set()
+    for token in IP_TOKEN.findall(text or ""):
+        addr, _, plen = token.partition("/")
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if plen and int(plen) != ip.max_prefixlen:
+            continue
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        found.add(ip)
+    return found
+
+
+def passwd_accounts(path="/etc/passwd"):
+    """Comptes locaux → shell."""
+    accounts = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                fields = line.rstrip("\n").split(":")
+                if len(fields) >= 7 and fields[0]:
+                    accounts[fields[0]] = fields[6]
+    except OSError:
+        pass
+    return accounts
+
+
+def db_purge_age():
+    out = fail2ban_client("get", "dbpurgeage")
+    match = re.search(r"(\d+)", out or "")
+    return int(match.group(1)) if match else None
+
+
+def db_health(db_path):
+    """Taille, intégrité (quick_check), nb de bans et plus ancien ban de la base."""
+    info = {"size": os.path.getsize(db_path)}
+    con = sqlite3.connect("file:{}?mode=ro".format(quote(db_path)), uri=True, timeout=30)
+    try:
+        info["check"] = con.execute("PRAGMA quick_check").fetchone()[0]
+        info["count"], info["oldest"] = con.execute(
+            "SELECT COUNT(*), MIN(timeofban) FROM bans").fetchone()
+    finally:
+        con.close()
+    return info
+
+
+def fmt_size(size):
+    for unit in ("o", "Kio", "Mio", "Gio"):
+        if size < 1024 or unit == "Gio":
+            return ("{:.0f} {}" if unit == "o" else "{:.1f} {}").format(size, unit)
+        size /= 1024.0
+
+
+def first_alert(findings):
+    return next((text for lvl, text in findings if lvl == "alert"), None)
+
+
+def worst(levels):
+    return max(levels, key=LEVELS.index) if levels else "ok"
+
+
+def check_ssh_logins(ctx):
+    lines, source = ctx["auth"]
+    if lines is None:
+        return "info", "contrôle impossible : " + source, []
+    accepted = ctx["events"][0]
+    known = None
+    if ctx["prev_state"] and "ssh_sources" in ctx["prev_state"]:
+        known = set(ctx["prev_state"]["ssh_sources"])
+    groups = collections.OrderedDict()
+    for event in accepted:
+        key = (event["user"], event["ip"], event["method"])
+        group = groups.setdefault(key, {"count": 0, "last": 0})
+        group["count"] += 1
+        group["last"] = max(group["last"], event["ts"])
+    ctx["state"]["ssh_sources"] = sources = dict((ctx["prev_state"] or {}).get("ssh_sources") or {})
+    for (_, ip, _), group in groups.items():
+        sources[ip] = max(sources.get(ip, 0), int(group["last"]))
+    if len(sources) > STATE_MAX_ITEMS:
+        keep = sorted(sources, key=sources.get, reverse=True)[:STATE_MAX_ITEMS]
+        ctx["state"]["ssh_sources"] = {ip: sources[ip] for ip in keep}
+    if not groups:
+        return "ok", "aucune connexion réussie sur la période (source : {})".format(source), []
+
+    rows, levels = [], []
+    for (user, ip, method), group in groups.items():
+        flags = []
+        if ip in ctx["banned_ips"]:
+            flags.append(("alert", "IP BANNIE par Fail2ban"))
+        if ctx["profile"] == "lan" and not is_internal(ip):
+            flags.append(("alert", "depuis Internet sur une machine LAN"))
+        if method in PASSWORD_METHODS:
+            flags.append(("warn" if ctx["profile"] == "vps" else "info", "par mot de passe"))
+        if user == "root":
+            flags.append(("info", "root"))
+        if known is not None and ip not in known:
+            flags.append(("warn", "source jamais vue"))
+        level = worst([lvl for lvl, _ in flags])
+        levels.append(level)
+        rows.append((LEVELS.index(level), group["count"], "{:<34} {:<22} ×{:<4} {}{}".format(
+            "{}@{}".format(user, ip), method, group["count"], fmt_ts(group["last"]),
+            ("  ← " + ", ".join(label for _, label in flags)) if flags else "")))
+    rows.sort(key=lambda r: (-r[0], -r[1]))
+    worst_level = worst(levels)
+    alerts = [r[2].split("  ← ")[0].split()[0] + " (" + r[2].split("  ← ")[1] + ")"
+              for r in rows if r[0] == LEVELS.index("alert")]
+    lines_out = [r[2] for r in rows[:20]]
+    if len(rows) > 20:
+        lines_out.append("… et {} autre(s) combinaison(s)".format(len(rows) - 20))
+    ips = {ip for _, ip, _ in groups}
+    summary = "{} depuis {} (source : {})".format(
+        plural(sum(g["count"] for g in groups.values()), "connexion réussie",
+               "connexions réussies"), plural(len(ips), "IP", "IP"), source)
+    if known is None and ctx["prev_state"] is not None:
+        summary += " — sources mémorisées pour les prochains rapports"
+    headline = "connexion réussie de " + ", ".join(alerts[:3]) + (" …" if len(alerts) > 3 else "")
+    return worst_level, summary, lines_out, headline
+
+
+def password_auth_enabled(cfg):
+    kbd = cfg.get("kbdinteractiveauthentication", cfg.get("challengeresponseauthentication", "no"))
+    return cfg.get("passwordauthentication") == "yes" or (kbd == "yes" and cfg.get("usepam") == "yes")
+
+
+def check_sshd_config(ctx):
+    cfg = ctx["sshd"]
+    if cfg is None:
+        return "info", "contrôle impossible : « sshd -T » indisponible (sshd absent, droits)", []
+    vps = ctx["profile"] == "vps"
+    findings = []
+    passwords = password_auth_enabled(cfg)
+    root = cfg.get("permitrootlogin", "?")
+    if root == "yes" and passwords:
+        findings.append(("alert" if vps else "warn",
+                         "PermitRootLogin yes avec mots de passe acceptés : root attaquable "
+                         "par force brute → « PermitRootLogin prohibit-password »"))
+    elif root == "yes":
+        findings.append(("info", "PermitRootLogin yes (clé seule tant que les mots de passe "
+                                 "sont refusés) → préférer « prohibit-password »"))
+    if passwords:
+        findings.append(("warn" if vps else "info",
+                         "authentification par mot de passe acceptée : seul Fail2ban freine "
+                         "la force brute → clés SSH + « PasswordAuthentication no »"))
+    if cfg.get("permitemptypasswords") == "yes":
+        findings.append(("alert", "PermitEmptyPasswords yes : connexion sans mot de passe possible"))
+    tries = cfg.get("maxauthtries", "6")
+    if tries.isdigit() and int(tries) > 6:
+        findings.append(("info", "MaxAuthTries {} (> 6) : plus d'essais par connexion".format(tries)))
+
+    ports, watched = set(cfg.get("ports") or []), ctx["jail_ports"]
+    if watched is None:
+        findings.append(("info", "ports de la jail sshd introuvables dans /etc/fail2ban"))
+    elif watched != "all" and ports - watched:
+        findings.append(("alert", "sshd écoute sur {} mais la jail sshd ne protège pas {} : "
+                                  "les bans n'y bloquent rien".format(
+                                      ",".join(map(str, sorted(ports))),
+                                      ",".join(map(str, sorted(ports - watched))))))
+    summary = "PermitRootLogin {}, mots de passe {}, port(s) {} (jail sshd : {})".format(
+        root, "acceptés" if passwords else "refusés", ",".join(map(str, sorted(ports))) or "?",
+        "tous" if watched == "all" else ",".join(map(str, sorted(watched or []))) or "?")
+    return worst([lvl for lvl, _ in findings]), summary, [
+        "[{}] {}".format(LEVEL_LABELS[lvl], text) for lvl, text in findings if lvl != "ok"
+    ], first_alert(findings)
+
+
+def check_firewall(ctx):
+    status = ctx["status"]
+    if status is None:
+        return "info", "contrôle impossible : Fail2ban ne répond pas", []
+    active = [(jail, ip) for jail, st in status.items() for ip in sorted(st["ips"])]
+    if not active:
+        return "ok", "aucun ban actif à vérifier", []
+    dump = ctx["firewall"]
+    if dump is None:
+        return "info", "contrôle impossible : règles du pare-feu illisibles " \
+                       "(nft/iptables absents ou droits insuffisants)", []
+    present = addresses_in(dump)
+    missing = collections.OrderedDict()
+    for jail, ip in active:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if addr not in present:
+            missing.setdefault(jail, []).append(ip)
+    if not missing:
+        return "ok", "{}, tous présents dans le pare-feu".format(
+            plural(len(active), "ban actif", "bans actifs")), []
+    count = sum(len(v) for v in missing.values())
+    lines = ["{} : {}{}".format(jail, ", ".join(ips[:10]), " …" if len(ips) > 10 else "")
+             for jail, ips in missing.items()]
+    return "alert", "{} sur {} absent(s) du pare-feu : ces IP ne sont PAS bloquées " \
+                    "(action de ban en échec, règles vidées par un rechargement ?)".format(
+                        count, plural(len(active), "ban actif", "bans actifs")), lines
+
+
+def check_accounts(ctx):
+    lines, source = ctx["auth"]
+    if lines is None:
+        return "info", "contrôle impossible : " + source, []
+    _, targets, invalid = ctx["events"]
+    if not targets:
+        return "ok", "aucune tentative d'authentification échouée journalisée", []
+    accounts = ctx["accounts"]
+    passwords = password_auth_enabled(ctx["sshd"] or {})
+    real = sorted((u for u in targets if u in accounts and u not in invalid),
+                  key=lambda u: (-len(targets[u]), u))
+    fake = sorted((u for u in targets if u not in real), key=lambda u: (-len(targets[u]), u))
+    interactive = [u for u in real if not accounts[u].rsplit("/", 1)[-1] in NO_LOGIN_SHELLS]
+    level, out = "info", []
+    if real:
+        out.append("Comptes existants visés : " + ", ".join(
+            "{} ({})".format(u, plural(len(targets[u]), "IP", "IP")) for u in real[:10]))
+    named = [u for u in interactive if u != "root"]
+    if named:
+        level = "warn"
+        out.append("[ATTENTION] compte(s) réel(s) non standard visé(s) : {} — nom connu "
+                   "de l'attaquant (fuite, énumération) ?".format(", ".join(named[:10])))
+    if interactive and passwords:
+        level = "warn"
+        out.append("[ATTENTION] mots de passe acceptés par sshd : ces comptes sont exposés "
+                   "à la force brute")
+    if fake:
+        out.append("Noms inexistants les plus essayés : " + ", ".join(
+            "{} ({})".format(u or "« vide »", len(targets[u])) for u in fake[:10]))
+    summary = "{} visé(s) dont {} existant(s), {} source(s)".format(
+        plural(len(targets), "nom d'utilisateur", "noms d'utilisateur"), len(real),
+        len(set().union(*targets.values())))
+    return level, summary, out
+
+
+def check_database(ctx):
+    db_path = ctx["db_path"]
+    if not db_path or not os.path.exists(db_path):
+        return "alert", "base introuvable ({}) : plus d'historique ni de restauration " \
+                        "des bans après redémarrage".format(db_path), []
+    info = db_health(db_path)
+    findings = []
+    if info["check"] != "ok":
+        findings.append(("alert", "intégrité : " + info["check"]))
+    if info["size"] > DB_SIZE_WARN:
+        findings.append(("warn", "base volumineuse ({}) : réduire dbpurgeage ?".format(
+            fmt_size(info["size"]))))
+    purge = db_purge_age()
+    if info["oldest"] and info["oldest"] > ctx["since"] + 86400:
+        findings.append(("info", "l'historique ne commence que le {} : rapport partiel".format(
+            fmt_ts(info["oldest"]))))
+    summary = "{}, {}, intégrité {}{}".format(
+        fmt_size(info["size"]), plural(info["count"] or 0, "ban", "bans"), info["check"],
+        ", purge après {} j".format(purge // 86400) if purge else "")
+    return worst([lvl for lvl, _ in findings]), summary, [
+        "[{}] {}".format(LEVEL_LABELS[lvl], text) for lvl, text in findings], first_alert(findings)
+
+
+CHECKS = collections.OrderedDict([
+    ("ssh_logins", check_ssh_logins), ("sshd_config", check_sshd_config),
+    ("firewall", check_firewall), ("accounts", check_accounts), ("database", check_database),
+])
+
+
+def run_checks(keys, since, until, profile, bans, status, prev_state, db_path):
+    """Exécute les contrôles demandés → ([Check], données à mémoriser)."""
+    if not keys:
+        return [], {}
+    active = set()
+    for st in (status or {}).values():
+        active |= st["ips"]
+    ctx = {"since": since, "until": until, "profile": profile, "status": status,
+           "prev_state": prev_state, "db_path": db_path, "state": {},
+           "banned_ips": {b.ip for b in bans} | active}
+    lazy = (
+        ("auth", lambda: read_auth_lines(since, until), ("ssh_logins", "accounts")),
+        ("sshd", sshd_effective_config, ("sshd_config", "accounts")),
+        ("jail_ports", jail_ports, ("sshd_config",)),
+        ("firewall", firewall_dump, ("firewall",)),
+        ("accounts", passwd_accounts, ("accounts",)),
+    )
+    for name, loader, users in lazy:
+        ctx[name] = None
+        if any(k in keys for k in users):
+            try:
+                ctx[name] = loader()
+            except Exception as exc:  # noqa: BLE001 — source indisponible ≠ rapport perdu
+                warn("source {} indisponible : {}".format(name, exc))
+    if ctx["auth"] is None:
+        ctx["auth"] = (None, "lecture des journaux impossible")
+    ctx["events"] = parse_ssh_events(ctx["auth"][0] or [])
+    results = []
+    for key in keys:
+        try:
+            result = tuple(CHECKS[key](ctx))
+        except Exception as exc:  # noqa: BLE001
+            result = ("info", "contrôle impossible : {}".format(exc), [])
+        level, summary, lines = result[:3]
+        headline = (result[3] if len(result) > 3 else None) or summary
+        results.append(Check(key, level, CHECK_TITLES[key], summary, lines, headline))
+    return results, ctx["state"]
+
+
+def parse_check_list(value):
+    """« yes » / « no » / « ssh_logins,firewall » → liste ordonnée de clés, ou ValueError."""
+    value = (value or "yes").strip().lower()
+    if value in ("yes", "oui", "1", "true", "on", "all"):
+        return list(CHECK_KEYS)
+    if value in ("no", "non", "0", "false", "off", "none"):
+        return []
+    keys = [k for k in re.split(r"[\s,]+", value) if k]
+    unknown = [k for k in keys if k not in CHECK_KEYS]
+    if unknown:
+        raise ValueError("contrôle(s) inconnu(s) : {} (connus : {})".format(
+            ", ".join(unknown), ", ".join(CHECK_KEYS)))
+    return [k for k in CHECK_KEYS if k in keys]
+
+
 # ----------------------------------------------------------------- rapport
 class Report(object):
     """Agrège les bans d'une période et produit les versions texte et HTML."""
 
     def __init__(self, host, days, bans, prev_count, seen_before, status, alerts,
-                 top_n=10, geoip=True, db_path=""):
+                 top_n=10, geoip=True, db_path="", profile="vps", prev_state=None,
+                 period_label=None, checks=None):
         self.host = host
+        self.checks = list(checks or [])
+        self.profile = profile if profile in PROFILES else "vps"
+        self.prev_state = prev_state
+        self._period_label = period_label
         self.days = days
         self.prev_count = prev_count
         self.status = status
@@ -2725,7 +3483,12 @@ class Report(object):
             last_seen[ban.ip] = max(last_seen.get(ban.ip, 0), ban.ts)
             ip_jails[ban.ip].add(ban.jail)
         top = per_ip.most_common(top_n)
-        countries = lookup_countries([ip for ip, _ in top]) if geoip else {}
+        # Cache des pays issu de l'état : pas de whois répété d'un rapport à l'autre
+        self.geo = dict((prev_state or {}).get("geo") or {})
+        if geoip:
+            missing = [ip for ip, _ in top if ip not in self.geo]
+            self.geo.update(lookup_countries(missing))
+        countries = self.geo
         self.top_ips = [{
             "ip": ip, "count": count, "jails": sorted(ip_jails[ip]),
             "last": last_seen[ip], "country": countries.get(ip, ""),
@@ -2744,13 +3507,95 @@ class Report(object):
         self.recidives = sorted((b for b in bans if "recidive" in b.jail),
                                 key=lambda b: b.ts, reverse=True)
 
+        # IP internes bannies : anomalie en LAN (poste compromis, scan, liste blanche)
+        self.internal = [{"ip": ip, "count": count, "jails": sorted(ip_jails[ip]),
+                          "last": last_seen[ip], "active": ip in active_ips}
+                         for ip, count in per_ip.most_common() if is_internal(ip)]
+        if self.internal and self.profile == "lan":
+            self.alerts.append(
+                "Profil LAN : {} bannie(s) depuis le réseau interne ({}) — poste compromis, "
+                "scan interne ou liste blanche incomplète ?".format(
+                    plural(len(self.internal), "IP interne", "IP internes"),
+                    ", ".join(i["ip"] for i in self.internal[:5])
+                    + (" …" if len(self.internal) > 5 else "")))
+
+        for chk in self.checks:
+            if chk.level == "alert":
+                self.alerts.append("{} : {}".format(chk.title, chk.headline))
+
+        self._per_ip = per_ip
+        self._all_nets = {net for net in net_ips if len(net_ips[net]) > 1}
+        self.delta = self._compute_delta(top_n)
+
+    # -- mémoire entre rapports -----------------------------------------------
+    def _current_jails(self):
+        return set(self.status) if self.status is not None else None
+
+    def _compute_delta(self, top_n):
+        prev = self.prev_state
+        if not prev:
+            return None
+        prev_ips = set(prev.get("ips") or {})
+        returning = sorted((ip for ip in self._per_ip if ip in prev_ips),
+                           key=lambda ip: (-self._per_ip[ip], ip))
+        known_nets = set(prev.get("networks") or [])
+        known_countries = set(prev.get("countries") or [])
+        jails_now, jails_prev = self._current_jails(), set(prev.get("jails") or [])
+        delta = {
+            "since": prev.get("generated"),
+            "prev_total": prev.get("total"),
+            "returning": [{"ip": ip, "count": self._per_ip[ip],
+                           "before": (prev.get("ips") or {}).get(ip, 0)}
+                          for ip in returning[:top_n]],
+            "returning_count": len(returning),
+            "new_networks": [n for n in self.networks if n["net"] not in known_nets],
+            "new_countries": sorted({i["country"] for i in self.top_ips if i["country"]}
+                                    - known_countries),
+            "jails_added": sorted(jails_now - jails_prev) if jails_now is not None else [],
+            "jails_removed": sorted(jails_prev - jails_now) if jails_now is not None else [],
+        }
+        if delta["jails_removed"]:
+            self.alerts.append("Jail(s) disparue(s) depuis le rapport précédent : "
+                               + ", ".join(delta["jails_removed"]))
+        return delta
+
+    def has_news(self):
+        d = self.delta
+        return bool(d and (d["returning"] or d["new_networks"] or d["new_countries"]
+                           or d["jails_added"] or d["jails_removed"]))
+
+    def state_snapshot(self, since, until):
+        """État à mémoriser : cumulatif pour pays/réseaux, période courante pour les IP."""
+        prev = self.prev_state or {}
+        jails = self._current_jails()
+        if jails is None:  # fail2ban muet : on garde la référence précédente
+            jails = set(prev.get("jails") or [])
+        return {
+            "version": STATE_VERSION,
+            "generated": int(time.time()),
+            "since": int(since), "until": int(until),
+            "profile": self.profile,
+            "total": self.total, "unique": self.unique,
+            "ips": dict(self._per_ip.most_common(STATE_MAX_ITEMS)),
+            "networks": capped(set(prev.get("networks") or []) | self._all_nets),
+            "countries": capped(set(prev.get("countries") or [])
+                                | {c for c in self.geo.values() if c}),
+            "jails": sorted(jails),
+            "geo": {ip: self.geo[ip] for ip in capped(self.geo)},
+        }
+
     # -- libellés -------------------------------------------------------------
     def period_label(self):
+        if self._period_label:
+            return self._period_label
         return "Du {} au {} ({})".format(fmt_date(self.days[0]), fmt_date(self.days[-1]),
                                          plural(len(self.days), "jour"))
 
     def trend(self):
         """(texte, couleur) de l'évolution par rapport à la période précédente."""
+        if self.prev_count is None and self.delta and self.delta["prev_total"] is not None:
+            # Base trop courte : comparaison avec le rapport précédent mémorisé
+            self.prev_count = self.delta["prev_total"]
         if self.prev_count is None:
             return "pas d'historique", MUTED
         if self.prev_count == 0:
@@ -2763,6 +3608,8 @@ class Report(object):
             DANGER if delta > 0 else SUCCESS)
 
     def subject(self, prefix):
+        if self.profile == "lan":
+            prefix = "{} [LAN]".format(prefix).strip()
         return "{} {}{} : {}, {} — {:%d/%m} → {:%d/%m}".format(
             prefix, "⚠ " if self.alerts else "", self.host,
             plural(self.total, "ban"), plural(self.unique, "IP", "IP"),
@@ -2787,6 +3634,28 @@ class Report(object):
         add("  Récidives ........... {:>6}".format(len(self.recidives)))
         add("  Bans actifs ......... {:>6}".format(na(self.banned_now)))
         add("")
+
+        if self.checks:
+            add("CONTRÔLES DE SÉCURITÉ")
+            for chk in self.checks:
+                add("  {:<12} {} — {}".format("[{}]".format(LEVEL_LABELS[chk.level]),
+                                               chk.title, chk.summary))
+                for line in chk.lines:
+                    add("               " + line)
+            add("")
+
+        add("NOUVEAUTÉS " + self.delta_title().upper())
+        for line in self.delta_lines():
+            add("  " + line)
+        add("")
+
+        if self.internal:
+            add("IP INTERNES BANNIES (profil {})".format(self.profile.upper()))
+            for item in self.internal:
+                add("  {:<39} {:>5} ban(s)  {:<24} {}{}".format(
+                    item["ip"], item["count"], ",".join(item["jails"]), fmt_ts(item["last"]),
+                    "  [banni]" if item["active"] else ""))
+            add("")
 
         add("BANS PAR JOUR")
         peak = max([count for _, count in self.per_day] + [1])
@@ -2836,6 +3705,40 @@ class Report(object):
         add("Généré le {:%d/%m/%Y à %H:%M} par fail2ban-report {} — base : {}".format(
             self.generated, __version__, self.db_path))
         return "\n".join(out) + "\n"
+
+    # -- nouveautés (communes texte / HTML) ------------------------------------
+    def delta_title(self):
+        if not self.delta:
+            return "depuis le rapport précédent"
+        since = self.delta.get("since")
+        if not since:
+            return "depuis le rapport précédent"
+        return "depuis le rapport du {:%d/%m/%Y}".format(dt.datetime.fromtimestamp(since))
+
+    def delta_lines(self):
+        """Lignes en texte brut ; vide = rien à signaler."""
+        d = self.delta
+        if d is None:
+            return ["Premier rapport mémorisé : les nouveautés apparaîtront au prochain envoi."]
+        lines = []
+        if d["jails_removed"]:
+            lines.append("Jail(s) disparue(s) : " + ", ".join(d["jails_removed"]))
+        if d["jails_added"]:
+            lines.append("Nouvelle(s) jail(s) : " + ", ".join(d["jails_added"]))
+        if d["new_countries"]:
+            lines.append("Nouveau(x) pays dans le top : " + ", ".join(
+                "{} {}".format(flag(c), c).strip() for c in d["new_countries"]))
+        for net in d["new_networks"]:
+            lines.append("Nouveau réseau actif : {} ({} bans, {} IP)".format(
+                net["net"], net["count"], net["ips"]))
+        if d["returning"]:
+            lines.append("{} déjà bannie(s) au rapport précédent :".format(
+                plural(d["returning_count"], "IP", "IP")))
+            for item in d["returning"]:
+                lines.append("  {:<39} {:>4} ban(s) (préc. : {})".format(
+                    item["ip"], item["count"], item["before"]))
+        return lines or ["Rien de nouveau : mêmes jails, pas de nouveau pays ni réseau, "
+                         "aucune IP du rapport précédent."]
 
     # -- version HTML ---------------------------------------------------------
     @staticmethod
@@ -2908,6 +3811,40 @@ class Report(object):
         rows.append('<tr><td style="padding:18px 22px 0"><table role="presentation" '
                     'width="100%" cellpadding="0" cellspacing="0"><tr>{}</tr></table>'
                     '</td></tr>'.format(cells))
+
+        if self.checks:
+            colors = {"ok": ("#dcfce7", "#166534"), "info": ("#e0e7ff", "#3730a3"),
+                      "warn": ("#fef3c7", "#92400e"), "alert": ("#fee2e2", "#991b1b")}
+            chk_rows = []
+            for chk in self.checks:
+                bg, fg = colors[chk.level]
+                detail = "".join('<div style="{}font-size:12px;color:{};margin-top:3px">{}</div>'
+                                 .format(MONO, MUTED, esc(line)) for line in chk.lines)
+                chk_rows.append([
+                    '<span style="background:{};color:{};border-radius:9px;padding:2px 8px;'
+                    'font-size:11px;font-weight:700;white-space:nowrap">{}</span>'.format(
+                        bg, fg, LEVEL_LABELS[chk.level]),
+                    "<b>{}</b><div style=\"font-size:13px;color:{}\">{}</div>{}".format(
+                        esc(chk.title), INK, esc(chk.summary), detail)])
+            rows.append(self._section("Contrôles de sécurité", self._table(
+                ["État", "Contrôle"], chk_rows, ["left", "left"])))
+
+        news = self.delta_lines()
+        rows.append(self._section(
+            "Nouveautés " + self.delta_title(),
+            '<ul style="margin:0;padding-left:18px;font-size:14px;line-height:1.6;color:{}">'
+            '{}</ul>'.format(INK if self.has_news() else MUTED, "".join(
+                '<li style="{}">{}</li>'.format(
+                    MONO + "font-size:13px;list-style:none" if line.startswith("  ") else "",
+                    esc(line.strip())) for line in news))))
+
+        if self.internal:
+            int_rows = [[mono(i["ip"]), str(i["count"]), esc(", ".join(i["jails"])),
+                         esc(fmt_ts(i["last"]))] for i in self.internal]
+            rows.append(self._section(
+                "IP internes bannies (profil {})".format(self.profile.upper()),
+                self._table(["IP", "Bans", "Jails", "Dernier ban"], int_rows,
+                            ["left", "right", "left", "left"])))
 
         peak = max([count for _, count in self.per_day] + [1])
         bars = []
@@ -3045,7 +3982,21 @@ def parse_args(argv):
                         help="écrit la version HTML dans FICHIER sans envoyer d'email")
     parser.add_argument("--until-now", action="store_true",
                         help="inclut la journée en cours (par défaut : jusqu'à minuit)")
+    parser.add_argument("--period", choices=("days", "month"),
+                        help="« days » : N derniers jours (défaut) ; « month » : mois "
+                             "calendaire précédent (défaut : REPORT_PERIOD)")
+    parser.add_argument("--profile", choices=PROFILES, help="remplace HOST_PROFILE")
+    parser.add_argument("--state", metavar="FICHIER",
+                        help="mémoire entre rapports (défaut : REPORT_STATE ou %s)" % DEFAULT_STATE)
+    parser.add_argument("--no-state", action="store_true",
+                        help="ignore la mémoire (ni lecture ni écriture)")
+    parser.add_argument("--save-state", action="store_true",
+                        help="mémorise ce rapport même sans envoi (aperçu, --until-now)")
     parser.add_argument("--no-geoip", action="store_true", help="pas de recherche whois")
+    parser.add_argument("--checks", metavar="LISTE",
+                        help="contrôles à exécuter : yes, no ou liste parmi " + ", ".join(CHECK_KEYS)
+                             + " (défaut : REPORT_CHECKS ou yes)")
+    parser.add_argument("--no-checks", action="store_true", help="aucun contrôle de sécurité")
     parser.add_argument("-q", "--quiet", action="store_true", help="aucun message si succès")
     parser.add_argument("-V", "--version", action="version", version="%(prog)s " + __version__)
     return parser.parse_args(argv)
@@ -3065,10 +4016,30 @@ def main(argv=None):
         return 2
     host = conf.get("REPORT_HOSTNAME") or socket.getfqdn()
 
+    period = args.period or (conf.get("REPORT_PERIOD") or "days").strip().lower()
+    if period not in ("days", "month"):
+        warn("REPORT_PERIOD invalide : {} (days|month)".format(period))
+        return 2
+    profile = args.profile or (conf.get("HOST_PROFILE") or "vps").strip().lower()
+    if profile not in PROFILES:
+        warn("HOST_PROFILE invalide : {} ({}) — « vps » utilisé".format(profile, "|".join(PROFILES)))
+        profile = "vps"
+
     # Période : jours calendaires complets, se terminant hier soir à minuit
     # (ou maintenant avec --until-now). Bornes calculées en heure locale.
     today = dt.date.today()
-    if args.until_now:
+    label = None
+    if period == "month":
+        # Mois précédent complet (mois en cours avec --until-now)
+        end = today if args.until_now else today.replace(day=1) - dt.timedelta(days=1)
+        first = end.replace(day=1)
+        days = (end - first).days + 1
+        until = time.time() if args.until_now else time.mktime(today.replace(day=1).timetuple())
+        prev_first = (first - dt.timedelta(days=1)).replace(day=1)
+        prev_since = time.mktime(prev_first.timetuple())
+        label = "{} {} ({}{})".format(MONTHS[first.month - 1].capitalize(), first.year,
+                                     plural(days, "jour"), ", en cours" if args.until_now else "")
+    elif args.until_now:
         first = today - dt.timedelta(days=days - 1)
         until = time.time()
     else:
@@ -3076,7 +4047,11 @@ def main(argv=None):
         until = time.mktime(today.timetuple())
     day_list = [first + dt.timedelta(days=i) for i in range(days)]
     since = time.mktime(first.timetuple())
-    prev_since = time.mktime((first - dt.timedelta(days=days)).timetuple())
+    if period != "month":
+        prev_since = time.mktime((first - dt.timedelta(days=days)).timetuple())
+
+    state_path = args.state or conf.get("REPORT_STATE") or DEFAULT_STATE
+    prev_state = None if args.no_state else load_state(state_path)
 
     alerts = []
     db_path = find_db(conf)
@@ -3094,10 +4069,32 @@ def main(argv=None):
         if missing:
             alerts.append("Jail(s) attendue(s) inactive(s) : " + ", ".join(missing))
 
+    try:
+        check_keys = [] if args.no_checks else parse_check_list(
+            args.checks or conf.get("REPORT_CHECKS"))
+    except ValueError as exc:
+        warn(str(exc))
+        return 2
+    checks, check_state = run_checks(check_keys, since, until, profile, bans, status,
+                                     prev_state, db_path)
+
     geoip = as_bool(conf.get("REPORT_GEOIP"), True) and not args.no_geoip
     report = Report(host, day_list, bans, prev_count, seen_before, status, alerts,
-                    top_n=top_n, geoip=geoip, db_path=db_path)
+                    top_n=top_n, geoip=geoip, db_path=db_path, profile=profile,
+                    prev_state=prev_state, period_label=label, checks=checks)
     text, html_doc = report.as_text(), report.as_html()
+
+    def remember():
+        if args.no_state:
+            return
+        try:
+            snapshot = report.state_snapshot(since, until)
+            snapshot.update(check_state)
+            if "ssh_sources" not in check_state and prev_state and "ssh_sources" in prev_state:
+                snapshot["ssh_sources"] = prev_state["ssh_sources"]  # contrôle désactivé
+            save_state(state_path, snapshot)
+        except OSError as exc:
+            warn("mémorisation impossible ({}) : {}".format(state_path, exc))
 
     if args.stdout or args.html:
         if args.stdout:
@@ -3110,6 +4107,8 @@ def main(argv=None):
         if args.html:
             with open(args.html, "w", encoding="utf-8") as handle:
                 handle.write(html_doc)
+        if args.save_state:
+            remember()
         return 0
 
     recipients = [a for a in re.split(r"[\s,;]+", args.to or conf.get("REPORT_TO", "")) if a]
@@ -3125,6 +4124,9 @@ def main(argv=None):
         return 1
     if not args.quiet:
         warn("rapport envoyé à {} via {}".format(", ".join(recipients), via))
+    # Un aperçu (--until-now) ne doit pas devenir la référence du prochain rapport
+    if args.save_state or not args.until_now:
+        remember()
     return 0
 
 
@@ -3185,11 +4187,12 @@ final_summary() {
     local rep="non installé"
     [[ $REPORT_REMOVE == true ]] && rep="désactivé (planification retirée)"
     if [[ $REPORT_ENABLED == true ]]; then
-        rep="chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME} → ${REPORT_TO}"
+        rep="$(report_when) → ${REPORT_TO}"
     fi
     kv "Port SSH" "$SSH_FINAL_PORTS"
     kv "Jail sshd" "${SSH_MAXRETRY} échecs / ${SSH_FINDTIME} → ${SSH_BANTIME}"
     kv "Jail sshd-recidive" "${RECIDIVE_MAXRETRY} bans / ${RECIDIVE_FINDTIME} → ${RECIDIVE_BANTIME} (tous ports)"
+    kv "Profil" "$HOST_PROFILE"
     kv "Rapport" "$rep"
     kv "Journal du script" "$LOG_FILE"
     kv "Sauvegardes" "$BACKUP_DIR"
@@ -3232,7 +4235,7 @@ parse_args() {
             --no-recidive-mail) OPT_RECIDIVE_MAIL=false ;;
             --force-hypervisor) OPT_FORCE_HYPERVISOR=true ;;
             --ssh-port | --ssh-mode | --ignore-ip | --email | --from | --smtp-host | --smtp-port | \
-                --smtp-user | --smtp-tls | --report-day | --report-time)
+                --smtp-user | --smtp-tls | --report-day | --report-time | --profile | --report-period)
                 if [[ -z $val ]]; then
                     (($# >= 2)) || die "L'option ${opt} attend une valeur."
                     val=$2
@@ -3250,12 +4253,19 @@ parse_args() {
                     --smtp-tls) SMTP_TLS_LEVEL=$val ;;
                     --report-day) OPT_REPORT_DAY=$val ;;
                     --report-time) OPT_REPORT_TIME=$val ;;
+                    --profile) OPT_PROFILE=${val,,} ;;
+                    --report-period) OPT_REPORT_PERIOD=$val ;;
                 esac
                 ;;
             *) die "Option inconnue : $1 (voir --help)" ;;
         esac
         shift
     done
+    if [[ -n $OPT_PROFILE ]] && ! is_profile "$OPT_PROFILE"; then die "--profile invalide : ${OPT_PROFILE} (vps|lan)"; fi
+    if [[ -n $OPT_REPORT_PERIOD ]]; then
+        is_period "$OPT_REPORT_PERIOD" || die "--report-period invalide : ${OPT_REPORT_PERIOD} (week|month)"
+        OPT_REPORT_PERIOD=$(normalize_period "$OPT_REPORT_PERIOD")
+    fi
     if [[ -n $OPT_REPORT_DAY ]] && ! is_day "$OPT_REPORT_DAY"; then die "--report-day invalide : ${OPT_REPORT_DAY}"; fi
     if [[ -n $OPT_REPORT_TIME ]] && ! is_hhmm "$OPT_REPORT_TIME"; then die "--report-time invalide : ${OPT_REPORT_TIME}"; fi
     case $SMTP_TLS_LEVEL in

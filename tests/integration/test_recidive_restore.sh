@@ -94,7 +94,7 @@ ok "restauration idempotente (état par démarrage)"
 echo "$(date '+%Y-%m-%d %H:%M:%S,000') fail2ban.actions [1]: NOTICE  [sshd] Ban $A" >>"$LOG"
 echo "$(date '+%Y-%m-%d %H:%M:%S,000') fail2ban.actions [1]: NOTICE  [sshd] Ban $C" >>"$LOG"
 for _ in $(seq 15); do
-    fail2ban-client status sshd-recidive | grep -q "$A" && break
+    [[ $(fail2ban-client status sshd-recidive) == *"$A"* ]] && break
     sleep 1
 done
 st=$(fail2ban-client status sshd-recidive)
