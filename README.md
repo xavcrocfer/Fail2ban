@@ -32,6 +32,9 @@ sudo ./setup.sh --help     # toutes les options
 - **Rapport HTML + texte** (timer systemd ou cron), hebdomadaire en VPS, mensuel (le 1er) en
   LAN : bans par jour, par jail, top des IP avec pays, réseaux /24 les plus actifs, récidives,
   comparaison avec la période précédente, alertes si une jail est tombée.
+- **Contrôles de sécurité** dans chaque rapport (voir plus bas) : connexions SSH réussies,
+  configuration effective de sshd, bans réellement présents dans le pare-feu, comptes visés,
+  santé de la base. Une ALERTE remonte en tête du rapport et dans le sujet (⚠).
 - **Section « Nouveautés »** : grâce à une mémoire entre deux rapports, seules les évolutions
   ressortent — jail disparue/ajoutée, nouveau pays, nouveau réseau actif, IP qui reviennent.
 - **Profil LAN** : tout ban d'une IP interne (RFC 1918, CGNAT, ULA…) est signalé comme
@@ -177,6 +180,21 @@ référence, sauf avec `--save-state` ; `--no-state` l'ignore complètement. Un 
 corrompu est simplement ignoré (le rapport l'indique comme « premier rapport »).
 Les pays déjà résolus y sont mis en cache, ce qui évite de relancer `whois` à chaque rapport.
 
+### Contrôles de sécurité
+
+Lecture seule, sans dépendance ni requête réseau. Réglage : `REPORT_CHECKS` dans
+`/etc/fail2ban/report.conf` (`yes`, `no` ou une liste), ou `--checks LISTE` / `--no-checks`.
+Un contrôle qui ne peut pas s'exécuter s'affiche « INFO — contrôle impossible » sans
+bloquer le rapport.
+
+| Clé | Ce qui est vérifié | ALERTE quand… |
+|---|---|---|
+| `ssh_logins` | connexions SSH **réussies** de la période (journald ou auth.log/secure/messages) | l'IP a été bannie par Fail2ban ; en LAN, la connexion vient d'Internet. ATTENTION : source jamais vue (mémorisée d'un rapport à l'autre), mot de passe sur un VPS |
+| `sshd_config` | configuration **effective** (`sshd -T`, inclut les `sshd_config.d/`) | sshd écoute sur un port que la jail `sshd` ne surveille pas (les bans n'y bloquent rien) ; `PermitRootLogin yes` + mots de passe sur un VPS ; `PermitEmptyPasswords yes` |
+| `firewall` | chaque ban actif est présent dans nftables / iptables / ipset | une IP « bannie » n'est pas dans le pare-feu : action de ban en échec, règles vidées par un rechargement |
+| `accounts` | noms d'utilisateur visés par les échecs | ATTENTION : compte réel non standard visé (nom connu de l'attaquant), ou comptes réels exposés alors que les mots de passe sont acceptés |
+| `database` | taille, intégrité (`PRAGMA quick_check`), profondeur d'historique, `dbpurgeage` | base absente ou corrompue |
+
 Les données viennent de la base SQLite de Fail2ban (90 jours d'historique) et de
 `fail2ban-client`. Le pays des IP est obtenu par `whois` (désactivable : `REPORT_GEOIP=no`).
 Une IP débannie manuellement est retirée de la base par Fail2ban et n'apparaît donc plus
@@ -212,7 +230,8 @@ tests/integration/run.sh debian13   # une seule distribution
 
 Ils couvrent : refus hyperviseur et `--force-hypervisor`, installation non interactive,
 Postfix TLS strict, `--no-report`, profil LAN/VPS et planification hebdo/mensuelle, mémoire
-du rapport, retour arrière SSH (SIGKILL de l'installateur, coupure de session, confirmation,
+du rapport, contrôles de sécurité sur système réel (ban vérifié dans nftables/iptables, puis
+règles vidées → ALERTE), retour arrière SSH (SIGKILL de l'installateur, coupure de session, confirmation,
 mode non interactif) et restauration de la récidive.
 
 Les scripts Python installés vivent dans `scripts/` (source de vérité, testables

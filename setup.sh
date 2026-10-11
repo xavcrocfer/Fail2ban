@@ -46,7 +46,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 #===============================================================================
 # 1. CONSTANTES & PARAMÈTRES
 #===============================================================================
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 readonly SCRIPT_NAME="fail2ban-setup"
 readonly MANAGED_MARK="Géré par ${SCRIPT_NAME}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
@@ -2416,6 +2416,10 @@ REPORT_TOP=10
 REPORT_GEOIP=yes
 # Jails dont l'absence déclenche une alerte dans le rapport
 EXPECTED_JAILS="sshd sshd-recidive"
+# Contrôles de sécurité : yes | no | liste parmi ssh_logins sshd_config firewall
+# accounts database (connexions réussies, sshd -T, bans ↔ pare-feu, comptes visés,
+# santé de la base). Un contrôle en ALERTE remonte en tête du rapport.
+REPORT_CHECKS=yes
 # Détectés automatiquement si vides :
 F2B_DB=""
 SENDMAIL=""
@@ -2579,7 +2583,13 @@ gen_report_script() {
 # Profil (HOST_PROFILE) : « vps » (exposé à Internet) ou « lan » (réseau interne).
 # En LAN, tout ban d'une IP interne est une anomalie et déclenche une alerte.
 #
+# Contrôles de sécurité (REPORT_CHECKS, --checks / --no-checks) : connexions SSH
+# réussies (IP bannie, source jamais vue, mot de passe, Internet en LAN), « sshd -T »
+# (root, mots de passe, ports ↔ jail), bans actifs absents du pare-feu, comptes
+# visés, santé de la base. Un contrôle en ALERTE remonte en tête du rapport.
+#
 import argparse
+import calendar
 import collections
 import datetime as dt
 import html
@@ -2862,14 +2872,577 @@ def jails_status():
     return status
 
 
+# ----------------------------------------------------------------- contrôles
+# Niveau 1 : contrôles locaux, sans dépendance ni requête réseau. Chaque source
+# système (journaux, sshd -T, pare-feu, comptes) est une fonction de module que
+# les tests remplacent. Un contrôle qui plante devient un « INFO » : il ne doit
+# jamais empêcher l'envoi du rapport.
+# headline : phrase reprise en tête du rapport quand le contrôle est en ALERTE
+Check = collections.namedtuple("Check", "key level title summary lines headline")
+LEVELS = ("ok", "info", "warn", "alert")
+LEVEL_LABELS = {"ok": "OK", "info": "INFO", "warn": "ATTENTION", "alert": "ALERTE"}
+CHECK_KEYS = ("ssh_logins", "sshd_config", "firewall", "accounts", "database")
+CHECK_TITLES = {
+    "ssh_logins": "Connexions SSH réussies",
+    "sshd_config": "Configuration effective de sshd",
+    "firewall": "Cohérence Fail2ban ↔ pare-feu",
+    "accounts": "Comptes visés par les attaques",
+    "database": "Base de données Fail2ban",
+}
+AUTH_LOGS = ("/var/log/auth.log", "/var/log/secure", "/var/log/messages")
+SSH_ACCEPTED = re.compile(r"\bAccepted (\S+) for (\S+) from (\S+) port \d+")
+SSH_FAILED = re.compile(r"\bFailed (\S+) for (invalid user )?(\S+) from (\S+) port \d+")
+SSH_INVALID = re.compile(r"\bInvalid user (\S*) from (\S+)")
+SSH_PREAUTH = re.compile(r"\b(?:Connection closed by|Disconnected from) "
+                         r"(authenticating|invalid) user (\S+) (\S+) port \d+")
+SYSLOG_ISO = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:?\d\d)?\s+")
+SYSLOG_BSD = re.compile(r"^([A-Z][a-z]{2})\s+(\d{1,2}) (\d\d):(\d\d):(\d\d)\s+")
+BSD_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+PASSWORD_METHODS = ("password", "keyboard-interactive", "keyboard-interactive/pam")
+NO_LOGIN_SHELLS = ("nologin", "false", "sync", "shutdown", "halt")
+IP_TOKEN = re.compile(r"[0-9A-Fa-f:.]{2,}(?:/\d{1,3})?")
+DB_SIZE_WARN = 1 << 30
+
+
+def parse_syslog_ts(line, now=None):
+    """(horodatage, reste de la ligne) d'une ligne syslog RFC 3339 ou BSD, ou (None, line)."""
+    match = SYSLOG_ISO.match(line)
+    if match:
+        stamp, tz = match.group(1), match.group(2)
+        parsed = time.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+        if tz:
+            offset = 0
+            if tz != "Z":
+                offset = (int(tz[1:3]) * 3600 + int(tz[-2:]) * 60) * (1 if tz[0] == "+" else -1)
+            return calendar.timegm(parsed) - offset, line[match.end():]
+        return time.mktime(parsed), line[match.end():]
+    match = SYSLOG_BSD.match(line)
+    if match and match.group(1) in BSD_MONTHS:
+        now = now or time.time()
+        year = time.localtime(now).tm_year
+        fields = (BSD_MONTHS.index(match.group(1)) + 1, int(match.group(2)),
+                  int(match.group(3)), int(match.group(4)), int(match.group(5)))
+        try:
+            ts = time.mktime(dt.datetime(year, *fields).timetuple())
+            if ts > now + 86400:  # journal de décembre lu en janvier
+                ts = time.mktime(dt.datetime(year - 1, *fields).timetuple())
+        except ValueError:
+            return None, line
+        return ts, line[match.end():]
+    return None, line
+
+
+def find_exe(name):
+    return shutil.which(name) or next(
+        (p for p in ("/usr/sbin/" + name, "/sbin/" + name, "/usr/bin/" + name)
+         if os.access(p, os.X_OK)), None)
+
+
+def read_auth_lines(since, until):
+    """([(horodatage, ligne sshd)], source) de la période, ou (None, raison)."""
+    jctl = find_exe("journalctl")
+    if jctl and os.path.isdir("/run/systemd/system"):
+        # Facilités auth (4) et authpriv (10) : sshd, sshd-session, sshd-auth, PAM
+        out = run([jctl, "--no-pager", "-q", "-o", "short-unix",
+                   "--since", "@{}".format(int(since)), "--until", "@{}".format(int(until)),
+                   "SYSLOG_FACILITY=4", "SYSLOG_FACILITY=10"], timeout=120)
+        if out:
+            lines = []
+            for line in out.splitlines():
+                stamp, _, rest = line.partition(" ")
+                if "sshd" not in rest:
+                    continue
+                try:
+                    lines.append((float(stamp), rest))
+                except ValueError:
+                    continue
+            return lines, "journald"
+    lines, sources = [], []
+    for base in AUTH_LOGS:
+        for path in (base + ".1", base):  # rotation non compressée comprise
+            try:
+                if os.path.getmtime(path) < since:
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        if "sshd" not in line:
+                            continue
+                        ts, rest = parse_syslog_ts(line)
+                        if ts is not None and since <= ts < until:
+                            lines.append((ts, rest.rstrip("\n")))
+                sources.append(path)
+            except OSError:
+                continue
+        if sources:
+            break
+    if not sources:
+        return None, "aucun journal d'authentification lisible (journald, " + \
+            ", ".join(AUTH_LOGS) + ")"
+    return lines, ", ".join(sources)
+
+
+def parse_ssh_events(lines):
+    """Connexions réussies et noms d'utilisateur visés à partir des lignes sshd."""
+    accepted, targets, invalid = [], collections.defaultdict(set), set()
+    for ts, line in lines:
+        match = SSH_ACCEPTED.search(line)
+        if match:
+            accepted.append({"ts": ts, "method": match.group(1), "user": match.group(2),
+                             "ip": match.group(3)})
+            continue
+        match = SSH_FAILED.search(line)
+        if match:
+            targets[match.group(3)].add(match.group(4))
+            if match.group(2):
+                invalid.add(match.group(3))
+            continue
+        match = SSH_INVALID.search(line)
+        if match:
+            targets[match.group(1)].add(match.group(2))
+            invalid.add(match.group(1))
+            continue
+        match = SSH_PREAUTH.search(line)
+        if match:
+            targets[match.group(2)].add(match.group(3))
+            if match.group(1) == "invalid":
+                invalid.add(match.group(2))
+    return accepted, targets, invalid
+
+
+def parse_sshd_t(text):
+    """Sortie de « sshd -T » → dict (clés en minuscules ; ports = liste d'entiers)."""
+    conf, ports, listen_ports = {}, [], []
+    for line in text.splitlines():
+        key, _, value = line.strip().partition(" ")
+        key = key.lower()
+        if key == "port":
+            ports.append(int(value))
+        elif key == "listenaddress":
+            port = value.rpartition(":")[2]
+            if port.isdigit():
+                listen_ports.append(int(port))
+        elif key:
+            conf[key] = value.strip()
+    # ListenAddress avec port explicite prime sur Port
+    conf["ports"] = sorted(set(listen_ports or ports))
+    return conf
+
+
+def sshd_effective_config():
+    exe = find_exe("sshd")
+    if not exe:
+        return None
+    out = run([exe, "-T"])
+    if out is None:  # blocs Match : -T exige un contexte de connexion
+        out = run([exe, "-T", "-C", "user=root,host=localhost,addr=127.0.0.1"])
+    return parse_sshd_t(out) if out else None
+
+
+def resolve_ports(value):
+    """« ssh,2222 » / « 22:25 » / « all » → ensemble d'entiers, ou "all"."""
+    ports = set()
+    for token in re.split(r"[\s,]+", value or ""):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token in ("all", "any", "0:65535", "1:65535"):
+            return "all"
+        if ":" in token:
+            low, _, high = token.partition(":")
+            if low.isdigit() and high.isdigit():
+                ports.update(range(int(low), int(high) + 1))
+            continue
+        if token.isdigit():
+            ports.add(int(token))
+            continue
+        try:
+            ports.add(socket.getservbyname(token, "tcp"))
+        except OSError:
+            if token == "ssh":
+                ports.add(22)
+    return ports
+
+
+def jail_ports(jail="sshd", etc="/etc/fail2ban"):
+    """Ports surveillés par une jail, selon l'ordre de lecture de Fail2ban, ou None."""
+    import configparser
+    import glob
+    files = ([os.path.join(etc, "jail.conf")]
+             + sorted(glob.glob(os.path.join(etc, "jail.d", "*.conf")))
+             + [os.path.join(etc, "jail.local")]
+             + sorted(glob.glob(os.path.join(etc, "jail.d", "*.local"))))
+    port = default = None
+    for path in files:
+        # default_section neutralisé : [DEFAULT] devient une section ordinaire, ce qui
+        # distingue « port » propre à la jail de « port » hérité
+        parser = configparser.RawConfigParser(strict=False, default_section="\0",
+                                              inline_comment_prefixes=("#", ";"))
+        try:
+            if not parser.read(path, encoding="utf-8"):
+                continue
+        except (configparser.Error, UnicodeDecodeError):
+            continue
+        if parser.has_option(jail, "port"):
+            port = parser.get(jail, "port")
+        if parser.has_option("DEFAULT", "port"):
+            default = parser.get("DEFAULT", "port")
+    port = port or default
+    return resolve_ports(port) if port else None
+
+
+def firewall_dump():
+    """Texte des règles du pare-feu (nftables, iptables, ipset, hosts.deny), ou None.
+
+    None si aucun outil n'a pu être lu (absent, droits, netlink refusé) : sans
+    lecture réelle, impossible d'affirmer qu'un ban manque. hosts.deny seul ne
+    suffit pas à conclure, il ne fait que compléter.
+    """
+    parts, readable = [], False
+    for cmd in (["nft", "list", "ruleset"], ["iptables-save"], ["ip6tables-save"],
+                ["ipset", "list"]):
+        exe = find_exe(cmd[0])
+        if exe:
+            out = run([exe] + cmd[1:], timeout=60)
+            if out is not None:
+                readable = True
+                parts.append(out)
+    if not readable:
+        return None
+    try:
+        with open("/etc/hosts.deny", encoding="utf-8", errors="replace") as handle:
+            parts.append(handle.read())
+    except OSError:
+        pass
+    return "\n".join(parts)
+
+
+def addresses_in(text):
+    """Adresses (hôtes uniques, pas les réseaux) citées dans un texte de règles."""
+    found = set()
+    for token in IP_TOKEN.findall(text or ""):
+        addr, _, plen = token.partition("/")
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if plen and int(plen) != ip.max_prefixlen:
+            continue
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        found.add(ip)
+    return found
+
+
+def passwd_accounts(path="/etc/passwd"):
+    """Comptes locaux → shell."""
+    accounts = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                fields = line.rstrip("\n").split(":")
+                if len(fields) >= 7 and fields[0]:
+                    accounts[fields[0]] = fields[6]
+    except OSError:
+        pass
+    return accounts
+
+
+def db_purge_age():
+    out = fail2ban_client("get", "dbpurgeage")
+    match = re.search(r"(\d+)", out or "")
+    return int(match.group(1)) if match else None
+
+
+def db_health(db_path):
+    """Taille, intégrité (quick_check), nb de bans et plus ancien ban de la base."""
+    info = {"size": os.path.getsize(db_path)}
+    con = sqlite3.connect("file:{}?mode=ro".format(quote(db_path)), uri=True, timeout=30)
+    try:
+        info["check"] = con.execute("PRAGMA quick_check").fetchone()[0]
+        info["count"], info["oldest"] = con.execute(
+            "SELECT COUNT(*), MIN(timeofban) FROM bans").fetchone()
+    finally:
+        con.close()
+    return info
+
+
+def fmt_size(size):
+    for unit in ("o", "Kio", "Mio", "Gio"):
+        if size < 1024 or unit == "Gio":
+            return ("{:.0f} {}" if unit == "o" else "{:.1f} {}").format(size, unit)
+        size /= 1024.0
+
+
+def first_alert(findings):
+    return next((text for lvl, text in findings if lvl == "alert"), None)
+
+
+def worst(levels):
+    return max(levels, key=LEVELS.index) if levels else "ok"
+
+
+def check_ssh_logins(ctx):
+    lines, source = ctx["auth"]
+    if lines is None:
+        return "info", "contrôle impossible : " + source, []
+    accepted = ctx["events"][0]
+    known = None
+    if ctx["prev_state"] and "ssh_sources" in ctx["prev_state"]:
+        known = set(ctx["prev_state"]["ssh_sources"])
+    groups = collections.OrderedDict()
+    for event in accepted:
+        key = (event["user"], event["ip"], event["method"])
+        group = groups.setdefault(key, {"count": 0, "last": 0})
+        group["count"] += 1
+        group["last"] = max(group["last"], event["ts"])
+    ctx["state"]["ssh_sources"] = sources = dict((ctx["prev_state"] or {}).get("ssh_sources") or {})
+    for (_, ip, _), group in groups.items():
+        sources[ip] = max(sources.get(ip, 0), int(group["last"]))
+    if len(sources) > STATE_MAX_ITEMS:
+        keep = sorted(sources, key=sources.get, reverse=True)[:STATE_MAX_ITEMS]
+        ctx["state"]["ssh_sources"] = {ip: sources[ip] for ip in keep}
+    if not groups:
+        return "ok", "aucune connexion réussie sur la période (source : {})".format(source), []
+
+    rows, levels = [], []
+    for (user, ip, method), group in groups.items():
+        flags = []
+        if ip in ctx["banned_ips"]:
+            flags.append(("alert", "IP BANNIE par Fail2ban"))
+        if ctx["profile"] == "lan" and not is_internal(ip):
+            flags.append(("alert", "depuis Internet sur une machine LAN"))
+        if method in PASSWORD_METHODS:
+            flags.append(("warn" if ctx["profile"] == "vps" else "info", "par mot de passe"))
+        if user == "root":
+            flags.append(("info", "root"))
+        if known is not None and ip not in known:
+            flags.append(("warn", "source jamais vue"))
+        level = worst([lvl for lvl, _ in flags])
+        levels.append(level)
+        rows.append((LEVELS.index(level), group["count"], "{:<34} {:<22} ×{:<4} {}{}".format(
+            "{}@{}".format(user, ip), method, group["count"], fmt_ts(group["last"]),
+            ("  ← " + ", ".join(label for _, label in flags)) if flags else "")))
+    rows.sort(key=lambda r: (-r[0], -r[1]))
+    worst_level = worst(levels)
+    alerts = [r[2].split("  ← ")[0].split()[0] + " (" + r[2].split("  ← ")[1] + ")"
+              for r in rows if r[0] == LEVELS.index("alert")]
+    lines_out = [r[2] for r in rows[:20]]
+    if len(rows) > 20:
+        lines_out.append("… et {} autre(s) combinaison(s)".format(len(rows) - 20))
+    ips = {ip for _, ip, _ in groups}
+    summary = "{} depuis {} (source : {})".format(
+        plural(sum(g["count"] for g in groups.values()), "connexion réussie",
+               "connexions réussies"), plural(len(ips), "IP", "IP"), source)
+    if known is None and ctx["prev_state"] is not None:
+        summary += " — sources mémorisées pour les prochains rapports"
+    headline = "connexion réussie de " + ", ".join(alerts[:3]) + (" …" if len(alerts) > 3 else "")
+    return worst_level, summary, lines_out, headline
+
+
+def password_auth_enabled(cfg):
+    kbd = cfg.get("kbdinteractiveauthentication", cfg.get("challengeresponseauthentication", "no"))
+    return cfg.get("passwordauthentication") == "yes" or (kbd == "yes" and cfg.get("usepam") == "yes")
+
+
+def check_sshd_config(ctx):
+    cfg = ctx["sshd"]
+    if cfg is None:
+        return "info", "contrôle impossible : « sshd -T » indisponible (sshd absent, droits)", []
+    vps = ctx["profile"] == "vps"
+    findings = []
+    passwords = password_auth_enabled(cfg)
+    root = cfg.get("permitrootlogin", "?")
+    if root == "yes" and passwords:
+        findings.append(("alert" if vps else "warn",
+                         "PermitRootLogin yes avec mots de passe acceptés : root attaquable "
+                         "par force brute → « PermitRootLogin prohibit-password »"))
+    elif root == "yes":
+        findings.append(("info", "PermitRootLogin yes (clé seule tant que les mots de passe "
+                                 "sont refusés) → préférer « prohibit-password »"))
+    if passwords:
+        findings.append(("warn" if vps else "info",
+                         "authentification par mot de passe acceptée : seul Fail2ban freine "
+                         "la force brute → clés SSH + « PasswordAuthentication no »"))
+    if cfg.get("permitemptypasswords") == "yes":
+        findings.append(("alert", "PermitEmptyPasswords yes : connexion sans mot de passe possible"))
+    tries = cfg.get("maxauthtries", "6")
+    if tries.isdigit() and int(tries) > 6:
+        findings.append(("info", "MaxAuthTries {} (> 6) : plus d'essais par connexion".format(tries)))
+
+    ports, watched = set(cfg.get("ports") or []), ctx["jail_ports"]
+    if watched is None:
+        findings.append(("info", "ports de la jail sshd introuvables dans /etc/fail2ban"))
+    elif watched != "all" and ports - watched:
+        findings.append(("alert", "sshd écoute sur {} mais la jail sshd ne protège pas {} : "
+                                  "les bans n'y bloquent rien".format(
+                                      ",".join(map(str, sorted(ports))),
+                                      ",".join(map(str, sorted(ports - watched))))))
+    summary = "PermitRootLogin {}, mots de passe {}, port(s) {} (jail sshd : {})".format(
+        root, "acceptés" if passwords else "refusés", ",".join(map(str, sorted(ports))) or "?",
+        "tous" if watched == "all" else ",".join(map(str, sorted(watched or []))) or "?")
+    return worst([lvl for lvl, _ in findings]), summary, [
+        "[{}] {}".format(LEVEL_LABELS[lvl], text) for lvl, text in findings if lvl != "ok"
+    ], first_alert(findings)
+
+
+def check_firewall(ctx):
+    status = ctx["status"]
+    if status is None:
+        return "info", "contrôle impossible : Fail2ban ne répond pas", []
+    active = [(jail, ip) for jail, st in status.items() for ip in sorted(st["ips"])]
+    if not active:
+        return "ok", "aucun ban actif à vérifier", []
+    dump = ctx["firewall"]
+    if dump is None:
+        return "info", "contrôle impossible : règles du pare-feu illisibles " \
+                       "(nft/iptables absents ou droits insuffisants)", []
+    present = addresses_in(dump)
+    missing = collections.OrderedDict()
+    for jail, ip in active:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if addr not in present:
+            missing.setdefault(jail, []).append(ip)
+    if not missing:
+        return "ok", "{}, tous présents dans le pare-feu".format(
+            plural(len(active), "ban actif", "bans actifs")), []
+    count = sum(len(v) for v in missing.values())
+    lines = ["{} : {}{}".format(jail, ", ".join(ips[:10]), " …" if len(ips) > 10 else "")
+             for jail, ips in missing.items()]
+    return "alert", "{} sur {} absent(s) du pare-feu : ces IP ne sont PAS bloquées " \
+                    "(action de ban en échec, règles vidées par un rechargement ?)".format(
+                        count, plural(len(active), "ban actif", "bans actifs")), lines
+
+
+def check_accounts(ctx):
+    lines, source = ctx["auth"]
+    if lines is None:
+        return "info", "contrôle impossible : " + source, []
+    _, targets, invalid = ctx["events"]
+    if not targets:
+        return "ok", "aucune tentative d'authentification échouée journalisée", []
+    accounts = ctx["accounts"]
+    passwords = password_auth_enabled(ctx["sshd"] or {})
+    real = sorted((u for u in targets if u in accounts and u not in invalid),
+                  key=lambda u: (-len(targets[u]), u))
+    fake = sorted((u for u in targets if u not in real), key=lambda u: (-len(targets[u]), u))
+    interactive = [u for u in real if not accounts[u].rsplit("/", 1)[-1] in NO_LOGIN_SHELLS]
+    level, out = "info", []
+    if real:
+        out.append("Comptes existants visés : " + ", ".join(
+            "{} ({})".format(u, plural(len(targets[u]), "IP", "IP")) for u in real[:10]))
+    named = [u for u in interactive if u != "root"]
+    if named:
+        level = "warn"
+        out.append("[ATTENTION] compte(s) réel(s) non standard visé(s) : {} — nom connu "
+                   "de l'attaquant (fuite, énumération) ?".format(", ".join(named[:10])))
+    if interactive and passwords:
+        level = "warn"
+        out.append("[ATTENTION] mots de passe acceptés par sshd : ces comptes sont exposés "
+                   "à la force brute")
+    if fake:
+        out.append("Noms inexistants les plus essayés : " + ", ".join(
+            "{} ({})".format(u or "« vide »", len(targets[u])) for u in fake[:10]))
+    summary = "{} visé(s) dont {} existant(s), {} source(s)".format(
+        plural(len(targets), "nom d'utilisateur", "noms d'utilisateur"), len(real),
+        len(set().union(*targets.values())))
+    return level, summary, out
+
+
+def check_database(ctx):
+    db_path = ctx["db_path"]
+    if not db_path or not os.path.exists(db_path):
+        return "alert", "base introuvable ({}) : plus d'historique ni de restauration " \
+                        "des bans après redémarrage".format(db_path), []
+    info = db_health(db_path)
+    findings = []
+    if info["check"] != "ok":
+        findings.append(("alert", "intégrité : " + info["check"]))
+    if info["size"] > DB_SIZE_WARN:
+        findings.append(("warn", "base volumineuse ({}) : réduire dbpurgeage ?".format(
+            fmt_size(info["size"]))))
+    purge = db_purge_age()
+    if info["oldest"] and info["oldest"] > ctx["since"] + 86400:
+        findings.append(("info", "l'historique ne commence que le {} : rapport partiel".format(
+            fmt_ts(info["oldest"]))))
+    summary = "{}, {}, intégrité {}{}".format(
+        fmt_size(info["size"]), plural(info["count"] or 0, "ban", "bans"), info["check"],
+        ", purge après {} j".format(purge // 86400) if purge else "")
+    return worst([lvl for lvl, _ in findings]), summary, [
+        "[{}] {}".format(LEVEL_LABELS[lvl], text) for lvl, text in findings], first_alert(findings)
+
+
+CHECKS = collections.OrderedDict([
+    ("ssh_logins", check_ssh_logins), ("sshd_config", check_sshd_config),
+    ("firewall", check_firewall), ("accounts", check_accounts), ("database", check_database),
+])
+
+
+def run_checks(keys, since, until, profile, bans, status, prev_state, db_path):
+    """Exécute les contrôles demandés → ([Check], données à mémoriser)."""
+    if not keys:
+        return [], {}
+    active = set()
+    for st in (status or {}).values():
+        active |= st["ips"]
+    ctx = {"since": since, "until": until, "profile": profile, "status": status,
+           "prev_state": prev_state, "db_path": db_path, "state": {},
+           "banned_ips": {b.ip for b in bans} | active}
+    lazy = (
+        ("auth", lambda: read_auth_lines(since, until), ("ssh_logins", "accounts")),
+        ("sshd", sshd_effective_config, ("sshd_config", "accounts")),
+        ("jail_ports", jail_ports, ("sshd_config",)),
+        ("firewall", firewall_dump, ("firewall",)),
+        ("accounts", passwd_accounts, ("accounts",)),
+    )
+    for name, loader, users in lazy:
+        ctx[name] = None
+        if any(k in keys for k in users):
+            try:
+                ctx[name] = loader()
+            except Exception as exc:  # noqa: BLE001 — source indisponible ≠ rapport perdu
+                warn("source {} indisponible : {}".format(name, exc))
+    if ctx["auth"] is None:
+        ctx["auth"] = (None, "lecture des journaux impossible")
+    ctx["events"] = parse_ssh_events(ctx["auth"][0] or [])
+    results = []
+    for key in keys:
+        try:
+            result = tuple(CHECKS[key](ctx))
+        except Exception as exc:  # noqa: BLE001
+            result = ("info", "contrôle impossible : {}".format(exc), [])
+        level, summary, lines = result[:3]
+        headline = (result[3] if len(result) > 3 else None) or summary
+        results.append(Check(key, level, CHECK_TITLES[key], summary, lines, headline))
+    return results, ctx["state"]
+
+
+def parse_check_list(value):
+    """« yes » / « no » / « ssh_logins,firewall » → liste ordonnée de clés, ou ValueError."""
+    value = (value or "yes").strip().lower()
+    if value in ("yes", "oui", "1", "true", "on", "all"):
+        return list(CHECK_KEYS)
+    if value in ("no", "non", "0", "false", "off", "none"):
+        return []
+    keys = [k for k in re.split(r"[\s,]+", value) if k]
+    unknown = [k for k in keys if k not in CHECK_KEYS]
+    if unknown:
+        raise ValueError("contrôle(s) inconnu(s) : {} (connus : {})".format(
+            ", ".join(unknown), ", ".join(CHECK_KEYS)))
+    return [k for k in CHECK_KEYS if k in keys]
+
+
 # ----------------------------------------------------------------- rapport
 class Report(object):
     """Agrège les bans d'une période et produit les versions texte et HTML."""
 
     def __init__(self, host, days, bans, prev_count, seen_before, status, alerts,
                  top_n=10, geoip=True, db_path="", profile="vps", prev_state=None,
-                 period_label=None):
+                 period_label=None, checks=None):
         self.host = host
+        self.checks = list(checks or [])
         self.profile = profile if profile in PROFILES else "vps"
         self.prev_state = prev_state
         self._period_label = period_label
@@ -2945,6 +3518,10 @@ class Report(object):
                     plural(len(self.internal), "IP interne", "IP internes"),
                     ", ".join(i["ip"] for i in self.internal[:5])
                     + (" …" if len(self.internal) > 5 else "")))
+
+        for chk in self.checks:
+            if chk.level == "alert":
+                self.alerts.append("{} : {}".format(chk.title, chk.headline))
 
         self._per_ip = per_ip
         self._all_nets = {net for net in net_ips if len(net_ips[net]) > 1}
@@ -3057,6 +3634,15 @@ class Report(object):
         add("  Récidives ........... {:>6}".format(len(self.recidives)))
         add("  Bans actifs ......... {:>6}".format(na(self.banned_now)))
         add("")
+
+        if self.checks:
+            add("CONTRÔLES DE SÉCURITÉ")
+            for chk in self.checks:
+                add("  {:<12} {} — {}".format("[{}]".format(LEVEL_LABELS[chk.level]),
+                                               chk.title, chk.summary))
+                for line in chk.lines:
+                    add("               " + line)
+            add("")
 
         add("NOUVEAUTÉS " + self.delta_title().upper())
         for line in self.delta_lines():
@@ -3226,6 +3812,23 @@ class Report(object):
                     'width="100%" cellpadding="0" cellspacing="0"><tr>{}</tr></table>'
                     '</td></tr>'.format(cells))
 
+        if self.checks:
+            colors = {"ok": ("#dcfce7", "#166534"), "info": ("#e0e7ff", "#3730a3"),
+                      "warn": ("#fef3c7", "#92400e"), "alert": ("#fee2e2", "#991b1b")}
+            chk_rows = []
+            for chk in self.checks:
+                bg, fg = colors[chk.level]
+                detail = "".join('<div style="{}font-size:12px;color:{};margin-top:3px">{}</div>'
+                                 .format(MONO, MUTED, esc(line)) for line in chk.lines)
+                chk_rows.append([
+                    '<span style="background:{};color:{};border-radius:9px;padding:2px 8px;'
+                    'font-size:11px;font-weight:700;white-space:nowrap">{}</span>'.format(
+                        bg, fg, LEVEL_LABELS[chk.level]),
+                    "<b>{}</b><div style=\"font-size:13px;color:{}\">{}</div>{}".format(
+                        esc(chk.title), INK, esc(chk.summary), detail)])
+            rows.append(self._section("Contrôles de sécurité", self._table(
+                ["État", "Contrôle"], chk_rows, ["left", "left"])))
+
         news = self.delta_lines()
         rows.append(self._section(
             "Nouveautés " + self.delta_title(),
@@ -3390,6 +3993,10 @@ def parse_args(argv):
     parser.add_argument("--save-state", action="store_true",
                         help="mémorise ce rapport même sans envoi (aperçu, --until-now)")
     parser.add_argument("--no-geoip", action="store_true", help="pas de recherche whois")
+    parser.add_argument("--checks", metavar="LISTE",
+                        help="contrôles à exécuter : yes, no ou liste parmi " + ", ".join(CHECK_KEYS)
+                             + " (défaut : REPORT_CHECKS ou yes)")
+    parser.add_argument("--no-checks", action="store_true", help="aucun contrôle de sécurité")
     parser.add_argument("-q", "--quiet", action="store_true", help="aucun message si succès")
     parser.add_argument("-V", "--version", action="version", version="%(prog)s " + __version__)
     return parser.parse_args(argv)
@@ -3462,17 +4069,30 @@ def main(argv=None):
         if missing:
             alerts.append("Jail(s) attendue(s) inactive(s) : " + ", ".join(missing))
 
+    try:
+        check_keys = [] if args.no_checks else parse_check_list(
+            args.checks or conf.get("REPORT_CHECKS"))
+    except ValueError as exc:
+        warn(str(exc))
+        return 2
+    checks, check_state = run_checks(check_keys, since, until, profile, bans, status,
+                                     prev_state, db_path)
+
     geoip = as_bool(conf.get("REPORT_GEOIP"), True) and not args.no_geoip
     report = Report(host, day_list, bans, prev_count, seen_before, status, alerts,
                     top_n=top_n, geoip=geoip, db_path=db_path, profile=profile,
-                    prev_state=prev_state, period_label=label)
+                    prev_state=prev_state, period_label=label, checks=checks)
     text, html_doc = report.as_text(), report.as_html()
 
     def remember():
         if args.no_state:
             return
         try:
-            save_state(state_path, report.state_snapshot(since, until))
+            snapshot = report.state_snapshot(since, until)
+            snapshot.update(check_state)
+            if "ssh_sources" not in check_state and prev_state and "ssh_sources" in prev_state:
+                snapshot["ssh_sources"] = prev_state["ssh_sources"]  # contrôle désactivé
+            save_state(state_path, snapshot)
         except OSError as exc:
             warn("mémorisation impossible ({}) : {}".format(state_path, exc))
 
