@@ -25,12 +25,24 @@ __version__ = "dev"
 # Contrôles de sécurité (REPORT_CHECKS, --checks / --no-checks) : connexions SSH
 # réussies (IP bannie, source jamais vue, mot de passe, Internet en LAN), « sshd -T »
 # (root, mots de passe, ports ↔ jail), bans actifs absents du pare-feu, comptes
-# visés, santé de la base. Un contrôle en ALERTE remonte en tête du rapport.
+# visés, santé de la base ; niveau 2 : mises à jour/redémarrage, ports en écoute,
+# comptes et clés SSH, services en échec, disque, heure. Un contrôle en ALERTE
+# remonte en tête du rapport.
+#
+# Mode alertes (--alert-only, timer quotidien) : contrôles sur les dernières 24 h,
+# mail UNIQUEMENT s'il existe une alerte nouvelle (ou un rappel tous les
+# ALERT_REMIND_DAYS jours), mémoire séparée (<REPORT_STATE>-alerts.json). Ne
+# modifie jamais la référence du rapport périodique.
+#
+# Masquage (REPORT_REDACT=yes) : un nom d'utilisateur ressemblant à un mot de passe
+# (tapé par erreur dans le champ « login ») n'apparaît jamais dans un mail.
 #
 import argparse
+import base64
 import calendar
 import collections
 import datetime as dt
+import hashlib
 import html
 import ipaddress
 import json
@@ -783,7 +795,8 @@ def check_accounts(ctx):
                    "à la force brute")
     if fake:
         out.append("Noms inexistants les plus essayés : " + ", ".join(
-            "{} ({})".format(u or "« vide »", len(targets[u])) for u in fake[:10]))
+            "{} ({})".format(redact_name(u) if u else "« vide »", len(targets[u]))
+            for u in fake[:10]))
     summary = "{} visé(s) dont {} existant(s), {} source(s)".format(
         plural(len(targets), "nom d'utilisateur", "noms d'utilisateur"), len(real),
         len(set().union(*targets.values())))
@@ -831,7 +844,7 @@ def run_checks(keys, since, until, profile, bans, status, prev_state, db_path):
            "banned_ips": {b.ip for b in bans} | active}
     lazy = (
         ("auth", lambda: read_auth_lines(since, until), ("ssh_logins", "accounts")),
-        ("sshd", sshd_effective_config, ("sshd_config", "accounts")),
+        ("sshd", sshd_effective_config, ("sshd_config", "accounts", "local_accounts")),
         ("jail_ports", jail_ports, ("sshd_config",)),
         ("firewall", firewall_dump, ("firewall",)),
         ("accounts", passwd_accounts, ("accounts",)),
@@ -871,6 +884,437 @@ def parse_check_list(value):
         raise ValueError("contrôle(s) inconnu(s) : {} (connus : {})".format(
             ", ".join(unknown), ", ".join(CHECK_KEYS)))
     return [k for k in CHECK_KEYS if k in keys]
+
+
+# ----------------------------------------------------------- contrôles niveau 2
+# État du système : mises à jour, ports, comptes/clés, services, disque, heure.
+# Toujours en lecture seule : les gestionnaires de paquets sont interrogés sur
+# leur cache local (aucun « apt update », aucune requête réseau).
+SYSTEM_FS = ("/", "/var", "/var/log", "/var/lib/fail2ban", "/boot", "/home", "/tmp")
+DISK_WARN, DISK_ALERT = 90, 97
+SS_PROC = re.compile(r'users:\(\("([^"]+)"')
+LOGIN_SHELL_EXCLUDE = NO_LOGIN_SHELLS + ("git-shell",)
+
+
+def run_rc(cmd, timeout=60):
+    """(code retour, sortie standard) ; (None, "") si la commande est introuvable."""
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              universal_newlines=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return proc.returncode, proc.stdout
+
+
+def pending_updates():
+    """(total, dont sécurité ou None, gestionnaire) depuis le cache local, ou None."""
+    exe = find_exe("apt")
+    if exe:
+        out = run([exe, "list", "--upgradable"], timeout=180)
+        if out is None:
+            return None
+        lines = [l for l in out.splitlines() if "[upgradable" in l]
+        return len(lines), sum(1 for l in lines if "-security" in l.split(" ")[0]), "apt"
+    exe = find_exe("dnf") or find_exe("yum")
+    if exe:
+        rc, out = run_rc([exe, "-q", "-C", "check-update"], timeout=180)
+        if rc not in (0, 100):  # cache absent : on ne télécharge rien
+            return None
+        total = len([l for l in out.splitlines()
+                     if len(l.split()) == 3 and not l.startswith((" ", "Obsoleting"))])
+        rc, sec = run_rc([exe, "-q", "-C", "updateinfo", "list", "--security"], timeout=180)
+        security = len([l for l in sec.splitlines() if l.strip()]) if rc == 0 else None
+        return total, security, os.path.basename(exe)
+    exe = find_exe("apk")
+    if exe:
+        out = run([exe, "version", "-l", "<"], timeout=120)
+        if out is None:
+            return None
+        return len([l for l in out.splitlines() if " < " in l]), None, "apk"
+    return None
+
+
+def in_container():
+    """Conteneur (LXC, podman, docker) : le noyau est celui de l'hôte."""
+    if os.path.exists("/run/.containerenv") or os.path.exists("/.dockerenv"):
+        return True
+    try:
+        with open("/proc/1/environ", "rb") as handle:
+            return b"container=" in handle.read()
+    except OSError:
+        return False
+
+
+def reboot_required():
+    """Raison pour laquelle un redémarrage est attendu, ou None."""
+    if os.path.exists("/run/reboot-required") or os.path.exists("/var/run/reboot-required"):
+        try:
+            with open("/var/run/reboot-required.pkgs", encoding="utf-8") as handle:
+                pkgs = sorted({l.strip() for l in handle if l.strip()})
+            return "demandé par : " + ", ".join(pkgs[:5]) + (" …" if len(pkgs) > 5 else "")
+        except OSError:
+            return "/var/run/reboot-required présent"
+    exe = find_exe("needs-restarting")
+    if exe:
+        rc, _ = run_rc([exe, "-r"])
+        if rc == 1:
+            return "needs-restarting -r : noyau ou bibliothèques de base mis à jour"
+    if in_container():
+        return None
+    release = os.uname().release
+    try:
+        installed = os.listdir("/lib/modules")
+    except OSError:
+        installed = []
+    if installed and release not in installed:
+        return "noyau en cours {} remplacé (installés : {})".format(release, ", ".join(sorted(installed)))
+    return None
+
+
+def listening_sockets():
+    """{« tcp/22 » : processus} des sockets en écoute hors boucle locale, ou None."""
+    exe = find_exe("ss")
+    if not exe:
+        return None
+    out = run([exe, "-Hlntup"])
+    if out is None:
+        out = run([exe, "-Hlntu"])  # sans -p (droits) : pas de nom de processus
+    if out is None:
+        return None
+    found = {}
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) < 5:
+            continue
+        proto, local = cols[0], cols[4]
+        addr, _, port = local.rpartition(":")
+        addr = addr.strip("[]").split("%")[0]
+        if not port.isdigit():
+            continue
+        if addr.startswith("127.") or addr in ("::1", "localhost") or "%lo" in local:
+            continue
+        proc = SS_PROC.search(line)
+        key = "{}/{}".format(proto, port)
+        found[key] = found.get(key) or (proc.group(1) if proc else "?")
+    return found
+
+
+def passwd_entries(path="/etc/passwd"):
+    """[(nom, uid, dossier, shell)] des comptes locaux."""
+    entries = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                f = line.rstrip("\n").split(":")
+                if len(f) >= 7 and f[0] and f[2].lstrip("-").isdigit():
+                    entries.append((f[0], int(f[2]), f[5], f[6]))
+    except OSError:
+        pass
+    return entries
+
+
+def key_fingerprint(blob):
+    """Empreinte OpenSSH « SHA256:… » d'une clé publique encodée en base64."""
+    try:
+        raw = base64.b64decode(blob.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        return None
+    return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
+
+
+def authorized_keys(entries, sshd_cfg=None):
+    """{compte : {empreinte : type}} pour chaque fichier authorized_keys existant."""
+    patterns = ((sshd_cfg or {}).get("authorizedkeysfile") or
+                ".ssh/authorized_keys .ssh/authorized_keys2").split()
+    result = {}
+    for name, uid, home, _ in entries:
+        for pattern in patterns:
+            if pattern.lower() == "none":
+                continue
+            path = pattern.replace("%h", home).replace("%u", name).replace("%U", str(uid)) \
+                .replace("%%", "%")
+            if not path.startswith("/"):
+                path = os.path.join(home, path)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    lines = handle.read().splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                tokens = line.strip().split()
+                for i, token in enumerate(tokens[:-1]):  # options éventuelles avant le type
+                    if token.startswith(("ssh-", "ecdsa-", "sk-")):
+                        fp = key_fingerprint(tokens[i + 1])
+                        if fp:
+                            result.setdefault(name, {})[fp] = token
+                        break
+    return result
+
+
+def failed_services():
+    """Services en échec (systemd --failed / OpenRC --crashed), ou None."""
+    exe = find_exe("systemctl")
+    if exe and os.path.isdir("/run/systemd/system"):
+        out = run([exe, "--failed", "--plain", "--no-legend", "--no-pager"])
+        if out is None:
+            return None
+        return [l.split()[0].lstrip("●* ") for l in out.splitlines() if l.split()]
+    exe = find_exe("rc-status")
+    if exe:
+        out = run([exe, "--crashed"])
+        return [l.split()[0] for l in (out or "").splitlines() if l.split()] if out is not None else None
+    return None
+
+
+def disk_usage(paths=SYSTEM_FS):
+    """[(point, % blocs, % inodes)] des systèmes de fichiers distincts."""
+    seen, result = set(), []
+    for path in paths:
+        try:
+            dev = os.stat(path).st_dev
+            st = os.statvfs(path)
+        except OSError:
+            continue
+        if dev in seen or not st.f_blocks:
+            continue
+        seen.add(dev)
+        used = st.f_blocks - st.f_bfree
+        pct = used * 100.0 / ((used + st.f_bavail) or 1)
+        ipct = ((st.f_files - st.f_ffree) * 100.0 / st.f_files) if st.f_files else 0.0
+        result.append((path, pct, ipct))
+    return result
+
+
+def time_sync():
+    """(synchronisée : bool, source) ou None si inconnu."""
+    exe = find_exe("timedatectl")
+    if exe and os.path.isdir("/run/systemd/system"):
+        out = run([exe, "show", "-p", "NTPSynchronized", "-p", "NTP"])
+        if out:
+            values = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+            if "NTPSynchronized" in values:
+                return values["NTPSynchronized"] == "yes", "timedatectl (NTP {})".format(
+                    "activé" if values.get("NTP") == "yes" else "désactivé")
+    exe = find_exe("chronyc")
+    if exe:
+        out = run([exe, "-n", "tracking"])
+        if out:
+            match = re.search(r"Leap status\s*:\s*(.+)", out)
+            if match:
+                return "Not synchronised" not in match.group(1), "chronyc"
+    return None
+
+
+def check_updates(ctx):
+    pending, reboot = pending_updates(), reboot_required()
+    findings, parts = [], []
+    if pending is None:
+        parts.append("paquets : cache du gestionnaire illisible")
+    else:
+        total, security, manager = pending
+        parts.append("{} en attente ({})".format(plural(total, "mise à jour", "mises à jour"),
+                                                  manager))
+        if security:
+            findings.append(("warn", "{} de sécurité à appliquer".format(
+                plural(security, "mise à jour", "mises à jour"))))
+        elif total and security is None:
+            findings.append(("info", "nature des mises à jour inconnue ({})".format(manager)))
+    if reboot:
+        findings.append(("warn", "redémarrage nécessaire : " + reboot))
+    parts.append("redémarrage " + ("NÉCESSAIRE" if reboot else "non requis"))
+    return worst([lvl for lvl, _ in findings]), ", ".join(parts), [
+        "[{}] {}".format(LEVEL_LABELS[lvl], text) for lvl, text in findings], None
+
+
+def check_ports(ctx):
+    current = listening_sockets()
+    if current is None:
+        return "info", "contrôle impossible : « ss » indisponible", [], None
+    ctx["state"]["ports"] = current
+    prev = (ctx["prev_state"] or {}).get("ports")
+    listing = ", ".join("{} ({})".format(k, v) for k, v in sorted(current.items(),
+                                                               key=lambda kv: (kv[0][:3], int(kv[0][4:]))))
+    summary = "{} hors boucle locale : {}".format(
+        plural(len(current), "port en écoute", "ports en écoute"), listing or "aucun")
+    if prev is None:
+        return "info" if current else "ok", summary + " — mémorisés pour les prochains rapports", [], None
+    new = sorted(set(current) - set(prev))
+    gone = sorted(set(prev) - set(current))
+    lines = ["[{}] nouveau port en écoute : {} ({})".format(
+        LEVEL_LABELS["warn"], k, current[k]) for k in new]
+    lines += ["[INFO] port fermé depuis le rapport précédent : {} ({})".format(k, prev[k])
+              for k in gone]
+    return ("warn" if new else "ok"), summary, lines, None
+
+
+def check_local_accounts(ctx):
+    entries = passwd_entries()
+    if not entries:
+        return "info", "contrôle impossible : /etc/passwd illisible", [], None
+    findings = []
+    uid0 = [n for n, uid, _, _ in entries if uid == 0 and n != "root"]
+    if uid0:
+        findings.append(("alert", "compte(s) d'UID 0 autre(s) que root : " + ", ".join(uid0)))
+    login = sorted(n for n, _, _, shell in entries
+                   if shell and shell.rsplit("/", 1)[-1] not in LOGIN_SHELL_EXCLUDE)
+    keys = authorized_keys(entries, ctx["sshd"])
+    prev = ctx["prev_state"] or {}
+    if "login_accounts" in prev:
+        new = sorted(set(login) - set(prev["login_accounts"]))
+        if new:
+            findings.append(("warn", "nouveau(x) compte(s) avec shell : " + ", ".join(new)))
+    if "ssh_keys" in prev:
+        for user in sorted(keys):
+            added = sorted(set(keys[user]) - set(prev["ssh_keys"].get(user, [])))
+            if added:
+                findings.append(("alert" if user == "root" else "warn",
+                                 "clé(s) SSH ajoutée(s) pour {} : {}".format(user, ", ".join(
+                                     "{} {}".format(keys[user][fp], fp) for fp in added[:5]))))
+        for user in sorted(prev["ssh_keys"]):
+            removed = set(prev["ssh_keys"][user]) - set(keys.get(user, {}))
+            if removed:
+                findings.append(("info", "{} retirée(s) pour {}".format(
+                    plural(len(removed), "clé SSH", "clés SSH"), user)))
+    ctx["state"]["login_accounts"] = login
+    ctx["state"]["ssh_keys"] = {u: sorted(v) for u, v in keys.items()}
+    summary = "{} avec shell ({}), clés SSH : {}".format(
+        plural(len(login), "compte", "comptes"), ", ".join(login[:8]) + (" …" if len(login) > 8 else ""),
+        ", ".join("{} ({})".format(u, len(v)) for u, v in sorted(keys.items())) or "aucune")
+    if "ssh_keys" not in prev and ctx["prev_state"] is not None:
+        summary += " — mémorisés pour les prochains rapports"
+    return worst([lvl for lvl, _ in findings]), summary, [
+        "[{}] {}".format(LEVEL_LABELS[lvl], t) for lvl, t in findings], first_alert(findings)
+
+
+def check_services(ctx):
+    failed = failed_services()
+    if failed is None:
+        return "info", "contrôle impossible : ni systemd ni OpenRC interrogeable", [], None
+    if not failed:
+        return "ok", "aucun service en échec", [], None
+    critical = [u for u in failed if re.match(r"(fail2ban|sshd?|nftables|firewalld|iptables)\b", u)]
+    level = "alert" if critical else "warn"
+    head = "service(s) de sécurité en échec : " + ", ".join(critical) if critical else None
+    return level, "{} : {}".format(plural(len(failed), "service en échec", "services en échec"),
+                                   ", ".join(failed[:10])), [], head
+
+
+def check_disk(ctx):
+    usage = disk_usage()
+    if not usage:
+        return "info", "contrôle impossible : statvfs indisponible", [], None
+    findings = []
+    for path, pct, ipct in usage:
+        for what, value in (("espace", pct), ("inodes", ipct)):
+            if value >= DISK_ALERT:
+                findings.append(("alert", "{} {} plein à {:.0f} % : journaux et base Fail2ban "
+                                          "ne peuvent plus s'écrire".format(path, what, value)))
+            elif value >= DISK_WARN:
+                findings.append(("warn", "{} {} à {:.0f} %".format(path, what, value)))
+    summary = ", ".join("{} {:.0f} %".format(p, v) for p, v, _ in usage)
+    return worst([lvl for lvl, _ in findings]), summary, [
+        "[{}] {}".format(LEVEL_LABELS[lvl], t) for lvl, t in findings], first_alert(findings)
+
+
+def check_time(ctx):
+    sync = time_sync()
+    if sync is None:
+        return "info", "état de synchronisation inconnu (ni timedatectl ni chronyc)", [], None
+    synced, source = sync
+    if synced:
+        return "ok", "horloge synchronisée ({})".format(source), [], None
+    return "warn", "horloge NON synchronisée ({}) : horodatages des bans et des journaux " \
+                   "faussés, TLS fragile".format(source), [], None
+
+
+CHECKS.update([("updates", check_updates), ("ports", check_ports),
+               ("local_accounts", check_local_accounts), ("services", check_services),
+               ("disk", check_disk), ("time", check_time)])
+CHECK_TITLES.update({
+    "updates": "Mises à jour et redémarrage",
+    "ports": "Ports en écoute",
+    "local_accounts": "Comptes locaux et clés SSH",
+    "services": "Services en échec",
+    "disk": "Espace disque",
+    "time": "Synchronisation de l'heure",
+})
+CHECK_KEYS = tuple(CHECKS)
+
+
+# ------------------------------------------------------------------- masquage
+# Un mot de passe tapé dans le champ « login » finit dans les journaux (« Invalid
+# user P@ssw0rd2026 ») puis dans le rapport envoyé par mail : on masque les noms
+# d'utilisateur qui ressemblent à un secret.
+def looks_like_secret(name):
+    classes = sum(bool(re.search(p, name)) for p in (r"[a-z]", r"[A-Z]", r"\d", r"[^A-Za-z0-9]"))
+    return (len(name) >= 8 and classes == 4) or (len(name) >= 12 and classes >= 3) or len(name) >= 24
+
+
+def redact_name(name):
+    if REDACT and looks_like_secret(name):
+        return "‹masqué : {} car.›".format(len(name))
+    return name
+
+
+REDACT = True
+
+
+# ------------------------------------------------------------- mode alertes
+def alert_fingerprint(text):
+    """Identité stable d'une alerte : les compteurs varient, pas les IP ni les noms."""
+    return re.sub(r"(?<![\d.:])\d+(?![\d.:/])", "#", text)
+
+
+def alert_state_path(state_path):
+    root, _ = os.path.splitext(state_path)
+    return root + "-alerts.json"
+
+
+def pending_alerts(alerts, sent, now, remind_days):
+    """Alertes à envoyer : nouvelles, ou rappel au-delà de remind_days (0 = jamais)."""
+    due = []
+    for text in alerts:
+        info = sent.get(alert_fingerprint(text))
+        if info is None:
+            due.append((text, "nouvelle"))
+        elif remind_days and now - info.get("last_sent", 0) >= remind_days * 86400:
+            due.append((text, "toujours en cours depuis le {}".format(fmt_ts(info["first"]))))
+    return due
+
+
+def updated_alert_state(alerts, sent, now, notified):
+    """Ne garde que les alertes en cours : une alerte résolue qui revient sera renvoyée."""
+    state = {}
+    for text in alerts:
+        fp = alert_fingerprint(text)
+        info = dict(sent.get(fp) or {"first": int(now)})
+        if notified:
+            info["last_sent"] = int(now)
+        info.setdefault("last_sent", 0)
+        info["text"] = text[:300]
+        state[fp] = info
+    return state
+
+
+def alert_message(host, due, alerts, checks):
+    text = ["ALERTES FAIL2BAN — {}".format(host), "=" * 78]
+    for alert, why in due:
+        text.append("/!\\ {}  [{}]".format(alert, why))
+    others = [a for a in alerts if a not in {d[0] for d in due}]
+    if others:
+        text += ["", "Déjà signalées, toujours en cours :"] + ["  - " + a for a in others]
+    detail = [c for c in checks if c.level == "alert"]
+    if detail:
+        text += ["", "DÉTAIL"]
+        for chk in detail:
+            text.append("  {} — {}".format(chk.title, chk.summary))
+            text += ["      " + line for line in chk.lines]
+    text += ["", "-" * 78, "fail2ban-report {} --alert-only, {:%d/%m/%Y %H:%M}. Rapport complet : "
+             "fail2ban-report --stdout --until-now".format(__version__, dt.datetime.now())]
+    body = "\n".join(text) + "\n"
+    html_doc = ('<!DOCTYPE html><html><body style="{}color:{}"><pre style="{}font-size:13px;'
+                'white-space:pre-wrap">{}</pre></body></html>').format(FONT, INK, MONO, html.escape(body))
+    return body, html_doc
 
 
 # ----------------------------------------------------------------- rapport
@@ -1436,6 +1880,10 @@ def parse_args(argv):
                         help="contrôles à exécuter : yes, no ou liste parmi " + ", ".join(CHECK_KEYS)
                              + " (défaut : REPORT_CHECKS ou yes)")
     parser.add_argument("--no-checks", action="store_true", help="aucun contrôle de sécurité")
+    parser.add_argument("--alert-only", action="store_true",
+                        help="contrôles des dernières 24 h ; mail seulement si alerte nouvelle")
+    parser.add_argument("--no-redact", action="store_true",
+                        help="ne pas masquer les noms d'utilisateur ressemblant à un secret")
     parser.add_argument("-q", "--quiet", action="store_true", help="aucun message si succès")
     parser.add_argument("-V", "--version", action="version", version="%(prog)s " + __version__)
     return parser.parse_args(argv)
@@ -1454,6 +1902,11 @@ def main(argv=None):
         warn("--days doit être >= 1")
         return 2
     host = conf.get("REPORT_HOSTNAME") or socket.getfqdn()
+    global REDACT
+    REDACT = as_bool(conf.get("REPORT_REDACT"), True) and not args.no_redact
+    if args.alert_only:
+        # Fenêtre glissante des dernières 24 h
+        days, args.until_now, args.period = 1, True, "days"
 
     period = args.period or (conf.get("REPORT_PERIOD") or "days").strip().lower()
     if period not in ("days", "month"):
@@ -1523,6 +1976,22 @@ def main(argv=None):
                     prev_state=prev_state, period_label=label, checks=checks)
     text, html_doc = report.as_text(), report.as_html()
 
+    alert_path = alert_state_path(state_path)
+    now = time.time()
+
+    def remember_alerts(notified):
+        if args.no_state:
+            return
+        try:
+            sent = {} if args.no_state else (load_state(alert_path) or {}).get("alerts", {})
+            save_state(alert_path, {"version": STATE_VERSION, "alerts": updated_alert_state(
+                report.alerts, sent, now, notified)})
+        except OSError as exc:
+            warn("mémorisation des alertes impossible ({}) : {}".format(alert_path, exc))
+
+    if args.alert_only:
+        return alert_only(args, conf, host, report, checks, alert_path, now, remember_alerts)
+
     def remember():
         if args.no_state:
             return
@@ -1566,6 +2035,58 @@ def main(argv=None):
     # Un aperçu (--until-now) ne doit pas devenir la référence du prochain rapport
     if args.save_state or not args.until_now:
         remember()
+    # Alertes contenues dans ce rapport : le mode --alert-only ne les renverra pas
+    remember_alerts(True)
+    return 0
+
+
+def alert_only(args, conf, host, report, checks, alert_path, now, remember_alerts):
+    """Envoie un mail court s'il existe une alerte nouvelle (ou un rappel dû)."""
+    sent = {} if args.no_state else (load_state(alert_path) or {}).get("alerts", {})
+    try:
+        remind = int(conf.get("ALERT_REMIND_DAYS") or 7)
+    except ValueError:
+        remind = 7
+    due = pending_alerts(report.alerts, sent, now, remind)
+    if not due:
+        if not args.quiet:
+            warn("aucune alerte nouvelle ({} en cours, déjà signalée(s))".format(
+                len(report.alerts)))
+        if args.save_state or not (args.stdout or args.html):
+            remember_alerts(False)  # oublie les alertes résolues
+        return 0
+    text, html_doc = alert_message(host, due, report.alerts, checks)
+    prefix = conf.get("REPORT_SUBJECT_PREFIX") or "[Fail2ban]"
+    subject = "{} [ALERTE] {} : {}".format(prefix, host, plural(len(due), "alerte", "alertes"))
+    if args.stdout or args.html:
+        if args.stdout:
+            data = subject + "\n\n" + text
+            out = getattr(sys.stdout, "buffer", None)
+            if out is not None:
+                out.write(data.encode("utf-8"))
+                out.flush()
+            else:
+                sys.stdout.write(data)
+        if args.html:
+            with open(args.html, "w", encoding="utf-8") as handle:
+                handle.write(html_doc)
+        if args.save_state:
+            remember_alerts(True)
+        return 0
+    recipients = [a for a in re.split(r"[\s,;]+", args.to or conf.get("REPORT_TO", "")) if a]
+    if not recipients:
+        warn("aucun destinataire (REPORT_TO ou --to)")
+        return 2
+    msg, sender = build_message(conf, recipients, subject, text, html_doc, host)
+    try:
+        via = send(msg, sender, conf)
+    except Exception as exc:  # noqa: BLE001
+        warn("échec de l'envoi des alertes : {}".format(exc))
+        return 1
+    if not args.quiet:
+        warn("{} envoyée(s) à {} via {}".format(plural(len(due), "alerte", "alertes"),
+                                                ", ".join(recipients), via))
+    remember_alerts(True)
     return 0
 
 

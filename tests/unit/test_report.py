@@ -22,6 +22,7 @@ R = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(R)
 R.CHECKS_ORIG = dict(R.CHECKS)
 R.JAIL_PORTS_ORIG = R.jail_ports
+R.AUTHORIZED_KEYS_ORIG = R.authorized_keys
 
 
 def make_db(path, bans):
@@ -79,9 +80,35 @@ class ReportTest(unittest.TestCase):
         R.passwd_accounts = lambda: {"root": "/bin/bash", "xav": "/bin/bash",
                                      "www-data": "/usr/sbin/nologin"}
         R.db_purge_age = lambda: 90 * 86400
+        # Niveau 2
+        self.updates = (3, 0, "apt")
+        self.reboot = None
+        self.ports = {"tcp/22": "sshd"}
+        self.entries = [("root", 0, "/root", "/bin/bash"), ("xav", 1000, "/home/xav", "/bin/bash"),
+                        ("www-data", 33, "/var/www", "/usr/sbin/nologin")]
+        self.keys = {"xav": {"SHA256:aaa": "ssh-ed25519"}}
+        self.failed = []
+        self.disk = [("/", 42.0, 3.0)]
+        self.ntp = (True, "test")
+        R.pending_updates = lambda: self.updates
+        R.reboot_required = lambda: self.reboot
+        R.listening_sockets = lambda: dict(self.ports)
+        R.passwd_entries = lambda: list(self.entries)
+        R.authorized_keys = lambda entries, cfg=None: {u: dict(v) for u, v in self.keys.items()}
+        R.failed_services = lambda: list(self.failed)
+        R.disk_usage = lambda: list(self.disk)
+        R.time_sync = lambda: self.ntp
+        self.sent = []
+        R.send = lambda msg, sender, conf: self.sent.append(msg) or "test"
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def run_raw(self, *args):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = R.main(["-c", self.conf, "--no-geoip", "--to", "admin@example.org"] + list(args))
+        return rc, err.getvalue()
 
     def run_report(self, *args):
         out = io.StringIO()
@@ -289,6 +316,158 @@ class ReportTest(unittest.TestCase):
         rc, text = self.run_report("--until-now")
         self.assertIn("[ALERTE]     Base de données Fail2ban", text)
 
+    # -- contrôles de niveau 2 ---------------------------------------------------
+    def test_level2_all_ok(self):
+        make_db(self.db, [])
+        rc, text = self.run_report("--until-now")
+        chk = section(text, "CONTRÔLES DE SÉCURITÉ")
+        for title in ("Mises à jour et redémarrage", "Ports en écoute", "Comptes locaux et clés SSH",
+                      "Services en échec", "Espace disque", "Synchronisation de l'heure"):
+            self.assertIn(title, chk)
+        self.assertNotIn("[ALERTE]", chk)
+        self.assertNotIn("[ATTENTION]", chk)
+
+    def test_updates_and_reboot(self):
+        make_db(self.db, [])
+        self.updates, self.reboot = (12, 4, "apt"), "demandé par : linux-image-amd64"
+        rc, text = self.run_report("--until-now")
+        chk = section(text, "CONTRÔLES DE SÉCURITÉ")
+        self.assertIn("[ATTENTION]  Mises à jour et redémarrage — 12 mises à jour en attente (apt), "
+                      "redémarrage NÉCESSAIRE", chk)
+        self.assertIn("4 mises à jour de sécurité à appliquer", chk)
+        self.updates = None
+        rc, text = self.run_report("--until-now")
+        self.assertIn("cache du gestionnaire illisible", text)
+
+    def test_new_listening_port(self):
+        make_db(self.db, [])
+        self.run_report("--until-now", "--save-state")
+        self.ports["tcp/4444"] = "nc"
+        rc, text = self.run_report("--until-now")
+        self.assertIn("[ATTENTION] nouveau port en écoute : tcp/4444 (nc)", text)
+        del self.ports["tcp/22"]
+        rc, text = self.run_report("--until-now")
+        self.assertIn("port fermé depuis le rapport précédent : tcp/22 (sshd)", text)
+
+    def test_accounts_keys_and_uid0(self):
+        make_db(self.db, [])
+        self.run_report("--until-now", "--save-state")
+        self.keys["root"] = {"SHA256:evil": "ssh-rsa"}
+        self.keys["xav"]["SHA256:bbb"] = "ssh-ed25519"
+        self.entries.append(("backup", 1001, "/home/backup", "/bin/sh"))
+        rc, text = self.run_report("--until-now")
+        chk = section(text, "CONTRÔLES DE SÉCURITÉ")
+        self.assertIn("[ALERTE]     Comptes locaux et clés SSH", chk)
+        self.assertIn("clé(s) SSH ajoutée(s) pour root : ssh-rsa SHA256:evil", chk)
+        self.assertIn("[ATTENTION] clé(s) SSH ajoutée(s) pour xav : ssh-ed25519 SHA256:bbb", chk)
+        self.assertIn("nouveau(x) compte(s) avec shell : backup", chk)
+        self.assertIn("/!\\ Comptes locaux et clés SSH : clé(s) SSH ajoutée(s) pour root", text)
+        self.entries.append(("toor", 0, "/root", "/bin/bash"))
+        rc, text = self.run_report("--until-now")
+        self.assertIn("compte(s) d'UID 0 autre(s) que root : toor", text)
+
+    def test_services_disk_time(self):
+        make_db(self.db, [])
+        self.failed = ["fail2ban.service", "cups.service"]
+        self.disk = [("/", 98.2, 3.0), ("/var", 91.0, 95.0)]
+        self.ntp = (False, "timedatectl (NTP désactivé)")
+        rc, text = self.run_report("--until-now")
+        chk = section(text, "CONTRÔLES DE SÉCURITÉ")
+        self.assertIn("[ALERTE]     Services en échec — 2 services en échec : fail2ban.service, "
+                      "cups.service", chk)
+        self.assertIn("/!\\ Services en échec : service(s) de sécurité en échec : fail2ban.service",
+                      text)
+        self.assertIn("/ espace plein à 98 %", chk)
+        self.assertIn("[ATTENTION] /var espace à 91 %", chk)
+        self.assertIn("[ATTENTION] /var inodes à 95 %", chk)
+        self.assertIn("[ATTENTION]  Synchronisation de l'heure — horloge NON synchronisée", chk)
+        self.failed = ["cups.service"]
+        rc, text = self.run_report("--until-now")
+        self.assertIn("[ATTENTION]  Services en échec", text)
+
+    # -- masquage ------------------------------------------------------------
+    def test_redact_password_typed_as_login(self):
+        make_db(self.db, [])
+        self.auth = [auth(1, "Invalid user Tr0ub4dor&3x from 198.51.100.1 port 1"),
+                     auth(1, "Invalid user oracle from 198.51.100.2 port 1")]
+        rc, text = self.run_report("--until-now")
+        self.assertNotIn("Tr0ub4dor&3x", text)
+        self.assertIn("‹masqué : 12 car.› (1)", text)
+        self.assertIn("oracle (1)", text)
+        rc, text = self.run_report("--until-now", "--no-redact")
+        self.assertIn("Tr0ub4dor&3x", text)
+        for name in ("admin", "ubuntu", "postgres", "test123", "user_backup"):
+            self.assertFalse(R.looks_like_secret(name), name)
+        for name in ("P@ssw0rd!", "Summer2026-Paris", "a" * 24):
+            self.assertTrue(R.looks_like_secret(name), name)
+
+    # -- mode alertes ---------------------------------------------------------
+    def test_alert_only_sends_once_then_reminds(self):
+        make_db(self.db, [])
+        rc, err = self.run_raw("--alert-only")
+        self.assertEqual((rc, self.sent), (0, []))  # rien d'anormal : aucun mail
+        self.assertIn("aucune alerte nouvelle (0 en cours", err)
+
+        self.failed = ["sshd.service"]
+        rc, err = self.run_raw("--alert-only")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("[ALERTE]", self.sent[0]["Subject"])
+        body = self.sent[0].get_body(("plain",)).get_content()
+        self.assertIn("/!\\ Services en échec : service(s) de sécurité en échec : sshd.service  "
+                      "[nouvelle]", body)
+        self.assertIn("DÉTAIL", body)
+
+        rc, err = self.run_raw("--alert-only")  # même incident : pas de second mail
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("1 en cours, déjà signalée(s)", err)
+
+        # Rappel après ALERT_REMIND_DAYS
+        path = R.alert_state_path(self.state)
+        with open(path) as fh:
+            data = json.load(fh)
+        for info in data["alerts"].values():
+            info["last_sent"] -= 8 * 86400
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+        self.run_raw("--alert-only")
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("toujours en cours depuis le", self.sent[1].get_body(("plain",)).get_content())
+
+        # Incident résolu puis revenu : renvoyé
+        self.failed = []
+        self.run_raw("--alert-only")
+        self.failed = ["sshd.service"]
+        self.run_raw("--alert-only")
+        self.assertEqual(len(self.sent), 3)
+
+    def test_alert_only_counters_do_not_resend(self):
+        make_db(self.db, [])
+        self.disk = [("/", 97.4, 1.0)]
+        self.run_raw("--alert-only")
+        self.disk = [("/", 98.9, 1.0)]  # même disque plein, pourcentage différent
+        self.run_raw("--alert-only")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(R.alert_fingerprint("connexion réussie de xav@203.0.113.7 ×12"),
+                         "connexion réussie de xav@203.0.113.7 ×#")
+
+    def test_alert_only_preview_and_period_report_dedup(self):
+        make_db(self.db, [])
+        self.failed = ["nftables.service"]
+        rc, text = self.run_report("--alert-only")
+        self.assertIn("[ALERTE]", text)
+        self.assertFalse(os.path.exists(R.alert_state_path(self.state)))  # aperçu : rien mémorisé
+        # Le rapport périodique envoyé contient l'alerte : le mode alertes ne la renvoie pas
+        rc, _ = self.run_raw()
+        self.assertEqual(len(self.sent), 1)
+        self.run_raw("--alert-only")
+        self.assertEqual(len(self.sent), 1)
+        # ... et la référence du rapport périodique n'est jamais touchée par --alert-only
+        with open(self.state) as fh:
+            before = fh.read()
+        self.run_raw("--alert-only")
+        with open(self.state) as fh:
+            self.assertEqual(fh.read(), before)
+
 
 class ParsingTest(unittest.TestCase):
     def test_syslog_timestamps(self):
@@ -333,6 +512,20 @@ class ParsingTest(unittest.TestCase):
             self.assertIsNotNone(R.firewall_dump())  # ruleset vide = lecture réussie
         finally:
             R.run, R.find_exe = run, find
+
+    def test_key_fingerprint_matches_openssh(self):
+        # ssh-keygen -lf : SHA256:… de la clé de test ci-dessous
+        blob = "AAAAC3NzaC1lZDI1NTE5AAAAIEGQALWYrZRuRZ4gz4DInssa/dkR8n1cibwjU81tGUow"
+        fp = R.key_fingerprint(blob)
+        self.assertEqual(fp, "SHA256:hFSBnCtIqGtlSPlk8pt5BXoYAjXJ77Ia1LI6Trbyozk")
+        self.assertIsNone(R.key_fingerprint("pas du base64 !"))
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".ssh"))
+            with open(os.path.join(home, ".ssh", "authorized_keys"), "w") as fh:
+                fh.write('# commentaire\nfrom="10.0.0.0/8",no-pty ssh-ed25519 {} xav@pc\n'
+                         "ssh-ed25519 {} doublon\n".format(blob, blob))
+            keys = R.AUTHORIZED_KEYS_ORIG([("xav", 1000, home, "/bin/bash")])
+        self.assertEqual(keys, {"xav": {fp: "ssh-ed25519"}})
 
     def test_addresses_in(self):
         found = R.addresses_in("elements = { 203.0.113.7 timeout 1h, 2001:db8::5 }\n"
