@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck -S warning setup.sh tests/integration/*.sh
+      - name: setup.sh synchronisé avec scripts/
+        run: python3 scripts/embed.py --check
+      - name: Syntaxe des scripts Python
+        run: python3 -m py_compile scripts/*.py tests/unit/*.py
+
+  unit:
+    # Python 3.6 = plus ancien supporté par le rapport (RHEL 8 / Debian 10)
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.6", "3.13"]
+    runs-on: ubuntu-24.04
+    container: python:${{ matrix.python }}-slim
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests unitaires du rapport
+        run: python3 -m unittest discover -s tests/unit -v
