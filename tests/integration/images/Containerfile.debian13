@@ -1,0 +1,10 @@
+# Image de test « systemd réel » : sshd, fail2ban, postfix absents au départ
+FROM docker.io/library/debian:13
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      systemd systemd-sysv dbus openssh-server python3 iproute2 procps util-linux \
+      ca-certificates nftables && \
+    rm -f /etc/ssh/ssh_host_* && ssh-keygen -A && \
+    systemctl enable ssh && apt-get clean
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

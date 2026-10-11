@@ -45,7 +45,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 #===============================================================================
 # 1. CONSTANTES & PARAMÈTRES
 #===============================================================================
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="fail2ban-setup"
 readonly MANAGED_MARK="Géré par ${SCRIPT_NAME}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
@@ -72,7 +72,9 @@ readonly F2B_SERVICE_DROPIN="${SYSTEMD_DIR}/fail2ban.service.d/50-${SCRIPT_NAME}
 # SSH
 readonly SSH_PORT_DROPIN="/etc/ssh/sshd_config.d/00-${SCRIPT_NAME}-port.conf"
 readonly SSH_SOCKET_DROPIN="${SYSTEMD_DIR}/ssh.socket.d/00-${SCRIPT_NAME}-port.conf"
-readonly SSH_CONFIRM_TIMEOUT=300
+SSH_CONFIRM_TIMEOUT=${SSH_CONFIRM_TIMEOUT:-300}
+# Marge du retour arrière indépendant au-delà du délai de confirmation
+SSH_RB_GRACE=${SSH_RB_GRACE:-120}
 
 # Fonctionnement du script
 readonly STATE_DIR="/var/lib/${SCRIPT_NAME}"
@@ -107,6 +109,7 @@ OPT_NO_REPORT=false
 OPT_REPORT_DAY=""
 OPT_REPORT_TIME=""
 OPT_RECIDIVE_MAIL=true
+OPT_FORCE_HYPERVISOR=false
 ORIG_ARGS="$*"
 
 # --- État détecté / décidé pendant l'exécution ----------------------------------
@@ -115,6 +118,7 @@ INIT_SYSTEM=""
 FIREWALL="none" FW_POLICY_DROP=false NEED_NFTABLES=false
 BANACTION="" BANACTION_ALLPORTS=""
 SELINUX_MODE="absent"
+HYPERVISOR="" HYPERVISOR_EVIDENCE="" GUEST_VIRT="none" CONTAINER_VIRT="none"
 SSHD_BIN="" SSH_SERVICE="" SSH_SOCKET=false SSH_ON_22=false
 SSH_CONF_PORTS=() SSH_LISTEN_PORTS=()
 SSH_FINAL_PORTS="22"
@@ -128,6 +132,10 @@ IGNORE_EXTRA="" IGNORE_IPS=""
 REPORT_ENABLED=false REPORT_TO="" REPORT_FROM="" REPORT_DAY="mon" REPORT_TIME="08:00"
 MAIL_MODE="none"                 # relay | existing | none
 SMTP_HOST="" SMTP_PORT="587" SMTP_USER="" SMTP_PASSWORD="${SMTP_PASSWORD:-}"
+# secure = TLS obligatoire + vérification du certificat (défaut) ;
+# encrypt = TLS obligatoire sans vérification (relais interne à certificat auto-signé)
+SMTP_TLS_LEVEL="${SMTP_TLS_LEVEL:-secure}"
+REPORT_REMOVE=false
 JAIL_ERRORS=0
 STEP_NO=0
 LOG_READY=""
@@ -135,10 +143,10 @@ TMP_FILES=()
 
 # Réponses de l'exécution précédente (valeurs par défaut des questions)
 PREV_IGNORE_IPS="" PREV_REPORT_TO="" PREV_REPORT_FROM="" PREV_REPORT_DAY="" PREV_REPORT_TIME=""
-PREV_SMTP_HOST="" PREV_SMTP_PORT="" PREV_SMTP_USER=""
+PREV_SMTP_HOST="" PREV_SMTP_PORT="" PREV_SMTP_USER="" PREV_SMTP_TLS_LEVEL=""
 
 # Retour arrière SSH
-SSH_RB_ACTIVE=false SSH_RB_DIR="" SSH_RB_SELINUX=false SSH_RB_FW=""
+SSH_RB_ACTIVE=false SSH_RB_DIR=""
 SSH_RB_CREATED=()
 
 #===============================================================================
@@ -224,12 +232,17 @@ Installation
       --smtp-user IDENTIFIANT   Compte SMTP (mot de passe : variable SMTP_PASSWORD)
       --report-day JOUR         Jour du rapport : lun…dim / mon…sun (défaut lun)
       --report-time HH:MM       Heure du rapport (défaut 08:00)
-      --no-report               N'installe pas le rapport hebdomadaire
+      --smtp-tls NIVEAU         secure (défaut : TLS + certificat vérifié) | encrypt
+                                (TLS sans vérification, relais interne auto-signé)
+      --no-report               Pas de rapport hebdomadaire ; DÉSACTIVE et retire
+                                une planification déjà installée par ce script
       --no-recidive-mail        Pas d'email à chaque ban de récidive
 
 Autres actions
       --detect                  Affiche la détection système puis quitte
       --uninstall               Supprime la configuration installée par ce script
+      --force-hypervisor        Autorise l'installation sur un hyperviseur
+                                (Proxmox, KVM/libvirt, Xen dom0, LXD/Incus…) — déconseillé
   -h, --help                    Cette aide
   -V, --version                 Version
 
@@ -237,6 +250,11 @@ Variables d'environnement (valeurs par défaut entre crochets)
   SSH_MAXRETRY [5]  SSH_FINDTIME [1h]  SSH_BANTIME [24h]  SSH_MODE [normal]
   RECIDIVE_MAXRETRY [3]  RECIDIVE_FINDTIME [30d]  RECIDIVE_BANTIME [60d]
   SMTP_PASSWORD     mot de passe SMTP (évite de le saisir / de l'exposer dans ps)
+  SSH_CONFIRM_TIMEOUT [300]  délai pour confirmer le nouveau port SSH (s)
+  SSH_RB_GRACE [120]         marge avant retour arrière SSH automatique (s)
+
+Codes de retour
+  0 succès · 1 erreur · 3 hyperviseur détecté (voir --force-hypervisor) · 130 interrompu
 
 Exemples
   sudo ./setup.sh
@@ -725,6 +743,76 @@ detect_admin_ip() {
     return 0
 }
 
+# Hyperviseur (HÔTE de virtualisation) : le script refuse de s'y installer.
+# Les invités (VM, VPS) restent couverts ; seule l'information est affichée.
+# Raisons : SSH/pare-feu/Postfix d'un hyperviseur sont gérés par sa propre pile
+# (pve-firewall, corosync, pveproxy, réseau des VM…) qu'un ban « tous ports » ou un
+# changement de port SSH peut casser (cluster, migrations, console, sauvegardes).
+detect_hypervisor() {
+    local -a ev=()
+    local caps="" a
+    HYPERVISOR=""
+    # Proxmox VE
+    if [[ -d /etc/pve ]] || have pveversion || [[ -e /usr/share/perl5/PVE ]]; then
+        HYPERVISOR="Proxmox VE"
+        [[ -d /etc/pve ]] && ev+=("/etc/pve")
+        have pveversion && ev+=("pveversion")
+    fi
+    # Xen dom0
+    caps=$(cat /proc/xen/capabilities 2>/dev/null || true)
+    if [[ $caps == *control_d* ]]; then
+        HYPERVISOR=${HYPERVISOR:-"Xen (dom0)"}
+        ev+=("/proc/xen/capabilities=control_d")
+    fi
+    # KVM/QEMU via libvirt, ou QEMU lancé directement
+    for a in libvirtd virtqemud; do
+        if svc_is_active "$a"; then
+            HYPERVISOR=${HYPERVISOR:-"KVM/libvirt"}
+            ev+=("service ${a} actif")
+        fi
+    done
+    if pgrep -x 'qemu-system-[a-z0-9_]+|qemu-kvm|kvm' >/dev/null 2>&1; then
+        HYPERVISOR=${HYPERVISOR:-"KVM/QEMU"}
+        ev+=("processus QEMU en cours")
+    fi
+    # LXD / Incus (conteneurs système et VM)
+    for a in incus lxd snap.lxd.daemon; do
+        if svc_is_active "$a"; then
+            HYPERVISOR=${HYPERVISOR:-"LXD/Incus"}
+            ev+=("service ${a} actif")
+        fi
+    done
+    # VirtualBox hôte
+    if [[ -d /sys/module/vboxdrv ]]; then
+        HYPERVISOR=${HYPERVISOR:-"VirtualBox (hôte)"}
+        ev+=("module vboxdrv")
+    fi
+    HYPERVISOR_EVIDENCE=$(IFS=,; echo "${ev[*]}")
+    HYPERVISOR_EVIDENCE=${HYPERVISOR_EVIDENCE//,/, }
+    # Côté invité : information seulement
+    if have systemd-detect-virt; then
+        GUEST_VIRT=$(systemd-detect-virt --vm 2>/dev/null || true)
+        CONTAINER_VIRT=$(systemd-detect-virt --container 2>/dev/null || true)
+    fi
+    GUEST_VIRT=${GUEST_VIRT:-none}
+    CONTAINER_VIRT=${CONTAINER_VIRT:-none}
+    return 0
+}
+
+check_hypervisor() {
+    [[ -n $HYPERVISOR ]] || return 0
+    if [[ $OPT_FORCE_HYPERVISOR == true ]]; then
+        log_warn "Hyperviseur détecté (${HYPERVISOR}) : installation FORCÉE (--force-hypervisor)."
+        log_warn "Vérifiez la liste blanche (nœuds du cluster, IP de gestion) avant tout ban « tous ports »."
+        return 0
+    fi
+    log_error "Hyperviseur détecté : ${HYPERVISOR} (${HYPERVISOR_EVIDENCE})."
+    log_error "Ce script ne s'installe pas sur un hôte de virtualisation : un ban tous ports ou"
+    log_error "un changement de port SSH peut couper le cluster, les migrations ou la console."
+    log_error "Protégez plutôt les VM/conteneurs invités. Passer outre : --force-hypervisor."
+    exit 3
+}
+
 detect_all() {
     log_step "Détection de l'environnement"
     detect_os
@@ -734,6 +822,7 @@ detect_all() {
     detect_ssh
     detect_mta
     detect_admin_ip
+    detect_hypervisor
     HOST_FQDN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || uname -n)
     [[ -n $HOST_FQDN && $HOST_FQDN != "(none)" ]] || HOST_FQDN=$(uname -n)
     HOST_SHORT=${HOST_FQDN%%.*}
@@ -748,6 +837,11 @@ detect_all() {
     kv "Pare-feu" "$fw_desc"
     kv "Action de ban" "${BANACTION} / ${BANACTION_ALLPORTS}"
     kv "SELinux" "$SELINUX_MODE"
+    if [[ -n $HYPERVISOR ]]; then
+        kv "Virtualisation" "HYPERVISEUR ${HYPERVISOR} (${HYPERVISOR_EVIDENCE}) → exclu"
+    else
+        kv "Virtualisation" "invité VM : ${GUEST_VIRT} — conteneur : ${CONTAINER_VIRT}"
+    fi
     if [[ -n $SSHD_BIN ]]; then
         kv "Service SSH" "${SSH_SERVICE}$([[ $SSH_SOCKET == true ]] && echo ' (activé par ssh.socket)')"
         kv "Ports SSH" "configurés : ${SSH_CONF_PORTS[*]} — en écoute : ${listen_desc}"
@@ -1013,7 +1107,7 @@ load_previous_answers() {
     local k v
     while IFS='=' read -r k v; do
         case $k in
-            IGNORE_IPS | REPORT_TO | REPORT_FROM | REPORT_DAY | REPORT_TIME | SMTP_HOST | SMTP_PORT | SMTP_USER)
+            IGNORE_IPS | REPORT_TO | REPORT_FROM | REPORT_DAY | REPORT_TIME | SMTP_HOST | SMTP_PORT | SMTP_USER | SMTP_TLS_LEVEL)
                 printf -v "PREV_${k}" '%s' "$v"
                 ;;
         esac
@@ -1034,6 +1128,7 @@ REPORT_TIME=${REPORT_TIME}
 SMTP_HOST=${SMTP_HOST}
 SMTP_PORT=${SMTP_PORT}
 SMTP_USER=${SMTP_USER}
+SMTP_TLS_LEVEL=${SMTP_TLS_LEVEL}
 EOF
 }
 
@@ -1109,7 +1204,8 @@ questions_relay() {
     log_info "Exemples : smtp.gmail.com:587 (mot de passe d'application), ssl0.ovh.net:465,"
     log_info "smtp.office365.com:587, smtp-relay.brevo.com:587…"
     ask SMTP_HOST "Serveur SMTP relais" "${OPT_SMTP_HOST:-$PREV_SMTP_HOST}" is_hostname
-    ask SMTP_PORT "Port SMTP (587 STARTTLS, 465 TLS, 25)" "${OPT_SMTP_PORT:-${PREV_SMTP_PORT:-587}}" is_port
+    [[ $SMTP_TLS_LEVEL == secure && -n $PREV_SMTP_TLS_LEVEL && $ORIG_ARGS != *--smtp-tls* ]] && SMTP_TLS_LEVEL=$PREV_SMTP_TLS_LEVEL
+    ask SMTP_PORT "Port SMTP (587 STARTTLS, 465 TLS, 25 STARTTLS obligatoire)" "${OPT_SMTP_PORT:-${PREV_SMTP_PORT:-587}}" is_port
     ask SMTP_USER "Identifiant SMTP (vide = sans authentification)" "${OPT_SMTP_USER:-$PREV_SMTP_USER}"
     if [[ -n $SMTP_USER && -z $SMTP_PASSWORD ]]; then
         ask_secret SMTP_PASSWORD "Mot de passe SMTP (saisie masquée)"
@@ -1146,7 +1242,10 @@ questions_mail_transport() {
 
 questions_report() {
     REPORT_ENABLED=false
-    [[ $OPT_NO_REPORT == true ]] && return 0
+    if [[ $OPT_NO_REPORT == true ]]; then
+        report_schedule_present && REPORT_REMOVE=true
+        return 0
+    fi
     local def_to=${OPT_EMAIL:-$PREV_REPORT_TO} def_from day
     if [[ -z $def_to ]] && ! has_tty; then
         log_warn "Aucune adresse (--email) : rapport hebdomadaire non installé."
@@ -1210,12 +1309,13 @@ show_plan() {
     if [[ $REPORT_ENABLED == true ]]; then
         rep_desc="chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME} → ${REPORT_TO}"
         case $MAIL_MODE in
-            relay) mail_desc="Postfix → relais [${SMTP_HOST}]:${SMTP_PORT}${SMTP_USER:+ (compte ${SMTP_USER})}" ;;
+            relay) mail_desc="Postfix → relais [${SMTP_HOST}]:${SMTP_PORT}, TLS ${SMTP_TLS_LEVEL}${SMTP_USER:+ (compte ${SMTP_USER})}" ;;
             existing) mail_desc="MTA existant (${MTA_NAME})" ;;
             *) mail_desc="aucun (emails non envoyables)" ;;
         esac
     else
         rep_desc="non"
+        [[ $REPORT_REMOVE == true ]] && rep_desc="non — la planification existante sera DÉSACTIVÉE"
         mail_desc="-"
     fi
     kv "SSH" "$ssh_desc"
@@ -1291,7 +1391,7 @@ send_test_mail() {
 configure_postfix_relay() {
     log_step "Relais SMTP : Postfix → [${SMTP_HOST}]:${SMTP_PORT}"
     have postconf || die "postconf introuvable : installation de Postfix incomplète."
-    local main_cf=/etc/postfix/main.cf dbtype tls_level wrapper cafile="" proto=all c
+    local main_cf=/etc/postfix/main.cf dbtype tls_level=$SMTP_TLS_LEVEL wrapper=no cafile="" proto=all c
     local -a params
 
     if [[ ! -s $main_cf && -f /usr/share/postfix/main.cf.debian ]]; then
@@ -1309,14 +1409,18 @@ configure_postfix_relay() {
 
     dbtype=$(postconf -h default_database_type 2>/dev/null || true)
     dbtype=${dbtype:-hash}
-    case $SMTP_PORT in
-        465) tls_level=encrypt wrapper=yes ;;  # TLS implicite (SMTPS)
-        25) tls_level=may wrapper=no ;;        # STARTTLS opportuniste
-        *) tls_level=encrypt wrapper=no ;;     # STARTTLS obligatoire (587)
-    esac
+    # TLS TOUJOURS obligatoire, quel que soit le port : 465 = TLS implicite,
+    # 587/25/autre = STARTTLS exigé. « secure » vérifie en plus le certificat et le
+    # nom du relais (protège les identifiants SASL d'une interception) ;
+    # « encrypt » (--smtp-tls encrypt) chiffre sans vérifier : relais interne auto-signé.
+    [[ $SMTP_PORT == 465 ]] && wrapper=yes
     for c in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
         if [[ -r $c ]]; then cafile=$c; break; fi
     done
+    if [[ $tls_level == secure && -z $cafile ]]; then
+        die "Aucun magasin d'autorités (paquet ca-certificates) : impossible de vérifier le relais. Installez-le ou utilisez --smtp-tls encrypt."
+    fi
+    [[ $tls_level == encrypt ]] && log_warn "TLS sans vérification du certificat (--smtp-tls encrypt) : à réserver à un relais de confiance."
     [[ -e /proc/net/if_inet6 ]] || proto=ipv4
 
     params=(
@@ -1327,6 +1431,9 @@ configure_postfix_relay() {
         "relay_transport = relay"
         "smtp_tls_security_level = ${tls_level}"
         "smtp_tls_wrappermode = ${wrapper}"
+        "smtp_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
+        "smtp_tls_mandatory_ciphers = high"
+        "smtp_tls_verify_cert_match = hostname, nexthop, dot-nexthop"
         "smtp_tls_loglevel = 1"
         "sender_canonical_maps = static:${REPORT_FROM}"
     )
@@ -1339,7 +1446,8 @@ configure_postfix_relay() {
         params+=(
             "smtp_sasl_auth_enable = yes"
             "smtp_sasl_password_maps = ${dbtype}:/etc/postfix/sasl_passwd"
-            "smtp_sasl_security_options = noanonymous"
+            # Mécanismes en clair interdits hors TLS (défense en profondeur : TLS est déjà exigé)
+            "smtp_sasl_security_options = noanonymous, noplaintext"
             "smtp_sasl_tls_security_options = noanonymous"
         )
     else
@@ -1363,7 +1471,14 @@ ssh_socket_generator_present() {
         -x /lib/systemd/system-generators/sshd-socket-generator ]]
 }
 
+# reset-failed : plusieurs redémarrages rapprochés (phase de test, final, retour
+# arrière) peuvent atteindre StartLimitBurst (5 en 10 s) → systemd refuserait de
+# relancer sshd et la machine resterait SANS SSH. On remet le compteur à zéro.
 ssh_reload_service() {
+    if [[ $INIT_SYSTEM == systemd ]]; then
+        systemctl reset-failed "$SSH_SERVICE" >>"$LOG_FILE" 2>&1 || true
+        [[ $SSH_SOCKET == true ]] && { systemctl reset-failed ssh.socket >>"$LOG_FILE" 2>&1 || true; }
+    fi
     if [[ $SSH_SOCKET == true ]]; then
         run "systemd : rechargement" systemctl daemon-reload
         run "Redémarrage de ssh.socket" systemctl restart ssh.socket
@@ -1372,46 +1487,120 @@ ssh_reload_service() {
     fi
 }
 
-# Mémorise l'état d'un fichier avant modification (copie ou « à supprimer »)
+# ─── Retour arrière SSH indépendant du processus d'installation ──────────────
+# Tout l'état nécessaire est posé sur disque (SSH_RB_DIR) et un script autonome
+# rollback.sh sait tout restaurer. Il est armé AVANT toute modification :
+#   • systemd : timer transitoire (systemd-run --on-active) ;
+#   • sinon   : processus détaché (setsid nohup sleep … ; rollback.sh).
+# Ainsi, même si ce script est tué (SIGKILL, coupure SSH, OOM…), la configuration
+# d'origine revient seule après SSH_CONFIRM_TIMEOUT + SSH_RB_GRACE (120 s). Le désarmement crée
+# le répertoire « done » (mkdir atomique) : rollback.sh ne s'exécute qu'une fois.
+ssh_rb_unit() { printf '%s-ssh-rollback-%s' "$SCRIPT_NAME" "$RUN_ID"; }
+
 ssh_rb_save() {
     local f=$1
     if [[ -e $f ]]; then
-        if [[ ! -e ${SSH_RB_DIR}${f} ]]; then
-            mkdir -p "${SSH_RB_DIR}$(dirname "$f")"
-            cp -a "$f" "${SSH_RB_DIR}${f}"
+        if [[ ! -e ${SSH_RB_DIR}/files${f} ]]; then
+            mkdir -p "${SSH_RB_DIR}/files$(dirname "$f")"
+            cp -a "$f" "${SSH_RB_DIR}/files${f}"
         fi
         backup_file "$f"
     else
         SSH_RB_CREATED+=("$f")
+        printf '%s\n' "$f" >>"${SSH_RB_DIR}/created"
     fi
+}
+
+# Commandes de redémarrage de SSH, figées dans rollback.sh
+ssh_restart_cmds() {
+    if [[ $SSH_SOCKET == true ]]; then
+        printf 'systemctl daemon-reload\nsystemctl reset-failed %q\nsystemctl reset-failed ssh.socket\nsystemctl restart ssh.socket\n' "$SSH_SERVICE"
+    else
+        case $INIT_SYSTEM in
+            systemd) printf 'systemctl daemon-reload\nsystemctl reset-failed %q\nsystemctl restart %q\n' "$SSH_SERVICE" "$SSH_SERVICE" ;;
+            openrc) printf 'rc-service %q restart || hup_sshd\n' "$SSH_SERVICE" ;;
+            *) printf 'service %q restart || hup_sshd\n' "$SSH_SERVICE" ;;
+        esac
+    fi
+}
+
+gen_ssh_rollback_script() {
+    printf '#!/bin/bash\n'
+    managed_header
+    printf '# Retour arrière du changement de port SSH (exécution %s)\n' "$RUN_ID"
+    printf 'D=%q\nLOG=%q\nNEW_PORT=%q\n' "$SSH_RB_DIR" "$LOG_FILE" "$NEW_SSH_PORT"
+    cat <<'EOF'
+set -u
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mkdir "$D/done" 2>/dev/null || exit 0      # désarmé ou déjà exécuté
+exec >>"$LOG" 2>&1
+echo "$(date '+%F %T') [ROLLBACK] restauration de la configuration SSH (${1:-watchdog})"
+if [ -f "$D/created" ]; then
+    while IFS= read -r f; do [ -n "$f" ] && rm -f -- "$f"; done <"$D/created"
+fi
+if [ -d "$D/files" ]; then
+    (cd "$D/files" && find . -type f) | while IFS= read -r f; do
+        f=${f#.}
+        cp -a "$D/files$f" "$f"
+    done
+fi
+if [ -f "$D/selinux" ]; then semanage port -d -t ssh_port_t -p tcp "$NEW_PORT"; fi
+case "$(cat "$D/fw" 2>/dev/null)" in
+    firewalld) firewall-cmd --permanent --remove-port="${NEW_PORT}/tcp"; firewall-cmd --reload ;;
+    ufw) ufw --force delete allow "${NEW_PORT}/tcp" ;;
+esac
+# Repli si le gestionnaire de services refuse (état incohérent, « already running ») :
+# SIGHUP fait se ré-exécuter le sshd principal, qui relit la configuration et
+# rouvre ses ports, sans couper les sessions en cours.
+hup_sshd() {
+    pf=$(sshd -T 2>/dev/null | awk '$1 == "pidfile" {print $2}')
+    p=$(cat "${pf:-/run/sshd.pid}" 2>/dev/null)
+    [ -n "$p" ] && kill -HUP "$p" && echo "[ROLLBACK] SIGHUP envoyé à sshd (pid $p)"
+}
+EOF
+    ssh_restart_cmds
+    printf 'echo "$(date %q) [ROLLBACK] terminé"\n' '+%F %T'
+}
+
+ssh_rb_arm() {
+    local delay=$((SSH_CONFIRM_TIMEOUT + SSH_RB_GRACE)) unit
+    unit=$(ssh_rb_unit)
+    if [[ $INIT_SYSTEM == systemd ]] && have systemd-run &&
+        systemd-run --quiet --unit="$unit" --on-active="${delay}s" \
+            --timer-property=AccuracySec=1s /bin/bash "${SSH_RB_DIR}/rollback.sh" watchdog \
+            >>"$LOG_FILE" 2>&1; then
+        printf 'systemd\n' >"${SSH_RB_DIR}/armed"
+        log_info "Retour arrière indépendant armé : ${unit}.timer (dans ${delay} s sauf confirmation)."
+    else
+        setsid nohup /bin/bash -c 'sleep "$1"; exec /bin/bash "$2" watchdog' _ "$delay" \
+            "${SSH_RB_DIR}/rollback.sh" </dev/null >/dev/null 2>&1 &
+        printf 'pid %s\n' "$!" >"${SSH_RB_DIR}/armed"
+        log_info "Retour arrière indépendant armé : processus détaché $! (dans ${delay} s sauf confirmation)."
+    fi
+}
+
+ssh_rb_disarm() {
+    local armed
+    [[ -n $SSH_RB_DIR && -d $SSH_RB_DIR ]] || return 0
+    mkdir "${SSH_RB_DIR}/done" 2>/dev/null || true
+    armed=$(cat "${SSH_RB_DIR}/armed" 2>/dev/null || true)
+    case $armed in
+        systemd) systemctl stop "$(ssh_rb_unit).timer" >>"$LOG_FILE" 2>&1 || true ;;
+        pid\ *) kill "${armed#pid }" 2>/dev/null || true ;;
+    esac
+    return 0
 }
 
 ssh_rollback() {
     [[ $SSH_RB_ACTIVE == true ]] || return 0
     SSH_RB_ACTIVE=false
-    local f err_trap
+    local err_trap
     err_trap=$(trap -p ERR)
     trap - ERR
     set +e
     log_warn "Retour arrière de la configuration SSH…"
-    for f in ${SSH_RB_CREATED[@]+"${SSH_RB_CREATED[@]}"}; do rm -f -- "$f"; done
-    if [[ -d $SSH_RB_DIR ]]; then
-        while IFS= read -r f; do
-            f=${f#.}
-            cp -a "${SSH_RB_DIR}${f}" "$f"
-        done < <(cd "$SSH_RB_DIR" && find . -type f)
-    fi
-    if [[ $SSH_RB_SELINUX == true ]]; then
-        semanage port -d -t ssh_port_t -p tcp "$NEW_SSH_PORT" >>"$LOG_FILE" 2>&1
-    fi
-    case $SSH_RB_FW in
-        firewalld)
-            firewall-cmd --permanent --remove-port="${NEW_SSH_PORT}/tcp" >>"$LOG_FILE" 2>&1
-            firewall-cmd --reload >>"$LOG_FILE" 2>&1
-            ;;
-        ufw) ufw --force delete allow "${NEW_SSH_PORT}/tcp" >>"$LOG_FILE" 2>&1 ;;
-    esac
-    ssh_reload_service
+    /bin/bash "${SSH_RB_DIR}/rollback.sh" "interruption ou échec"
+    ssh_rb_disarm
     if sshd_test_config; then
         log_ok "Configuration SSH d'origine restaurée (port ${SSH_CONF_PORTS[*]})."
     else
@@ -1430,11 +1619,11 @@ ssh_open_firewall() {
         firewalld)
             run "firewalld : ouverture de ${port}/tcp" firewall-cmd --permanent --add-port="${port}/tcp"
             run "firewalld : rechargement" firewall-cmd --reload
-            SSH_RB_FW=firewalld
+            printf 'firewalld\n' >"${SSH_RB_DIR}/fw"
             ;;
         ufw)
             run "ufw : ouverture de ${port}/tcp" ufw allow "${port}/tcp" comment "SSH (${SCRIPT_NAME})"
-            SSH_RB_FW=ufw
+            printf 'ufw\n' >"${SSH_RB_DIR}/fw"
             ;;
         nftables | iptables)
             if [[ $FW_POLICY_DROP == true ]]; then
@@ -1474,9 +1663,41 @@ ssh_offer_close_old_port() {
     return 0
 }
 
+# Écrit la liste de ports SSH voulue (drop-in, bloc en tête de sshd_config,
+# drop-in ssh.socket) — utilisé pour la phase « ancien + nouveau » puis « nouveau ».
+ssh_write_ports() {
+    local p tmp
+    if sshd_includes_dropins; then
+        { managed_header
+          for p in "$@"; do printf 'Port %s\n' "$p"; done; } | write_file "$SSH_PORT_DROPIN" 0644
+    else
+        tmp=$(mktemp)
+        TMP_FILES+=("$tmp")
+        { printf '# BEGIN %s (port SSH, %s)\n' "$SCRIPT_NAME" "$RUN_ID"
+          for p in "$@"; do printf 'Port %s\n' "$p"; done
+          printf '# END %s\n' "$SCRIPT_NAME"
+          awk -v b="# BEGIN ${SCRIPT_NAME} " -v e="# END ${SCRIPT_NAME}" '
+              index($0, b) == 1 { skip = 1; next }
+              skip && $0 == e   { skip = 0; next }
+              !skip' /etc/ssh/sshd_config; } >"$tmp"
+        cat "$tmp" >/etc/ssh/sshd_config   # « cat > » conserve droits et contexte SELinux
+    fi
+    if [[ $SSH_SOCKET == true ]] && ! ssh_socket_generator_present; then
+        { managed_header
+          printf '[Socket]\nListenStream=\n'
+          for p in "$@"; do printf 'ListenStream=%s\n' "$p"; done; } | write_file "$SSH_SOCKET_DROPIN" 0644
+    fi
+}
+
+ssh_ports_listening() {
+    local p
+    for p in "$@"; do wait_for_port "$p" 15 || return 1; done
+}
+
 change_ssh_port() {
     local port=$NEW_SSH_PORT f selinux_ports ans="" user
-    log_step "Changement du port SSH : ${SSH_CONF_PORTS[*]} → ${port}"
+    local -a old_ports=("${SSH_CONF_PORTS[@]}")
+    log_step "Changement du port SSH : ${old_ports[*]} → ${port}"
 
     # ListenAddress avec port explicite : la directive Port y est ignorée
     if sshd_config_files | xargs grep -qiE '^[[:space:]]*ListenAddress[[:space:]]+(\[[^]]+\]|[^:[:space:]]+):[0-9]+' 2>/dev/null; then
@@ -1491,46 +1712,33 @@ change_ssh_port() {
         return 0
     fi
 
-    SSH_RB_DIR=$(mktemp -d "/tmp/${SCRIPT_NAME}-ssh.XXXXXX")
+    # 0. Sauvegarde sur disque persistant + retour arrière indépendant, AVANT toute modification
+    install -d -m 0700 "$STATE_DIR"
+    SSH_RB_DIR="${STATE_DIR}/ssh-rollback.${RUN_ID}"
+    rm -rf "$SSH_RB_DIR"
+    install -d -m 0700 "$SSH_RB_DIR"
     SSH_RB_CREATED=()
     while IFS= read -r f; do ssh_rb_save "$f"; done < <(sshd_config_files)
     ssh_rb_save "$SSH_PORT_DROPIN"
     ssh_rb_save "$SSH_SOCKET_DROPIN"
+    gen_ssh_rollback_script >"${SSH_RB_DIR}/rollback.sh"
+    chmod 0700 "${SSH_RB_DIR}/rollback.sh"
     SSH_RB_ACTIVE=true
+    ssh_rb_arm
 
     # 1. Neutralise les directives Port existantes (elles sont cumulatives)
     while IFS= read -r f; do
+        [[ $f == "$SSH_PORT_DROPIN" ]] && continue
         if grep -qiE '^[[:space:]]*Port[[:space:]]' "$f"; then
             sed -i "s/^\([[:space:]]*[Pp][Oo][Rr][Tt][[:space:]].*\)$/#\1   # désactivé par ${SCRIPT_NAME} ${RUN_ID}/" "$f"
         fi
     done < <(sshd_config_files)
 
-    # 2. Nouveau port : drop-in si sshd_config.d est inclus, sinon en tête de fichier
-    if sshd_includes_dropins; then
-        write_file "$SSH_PORT_DROPIN" 0644 <<EOF
-$(managed_header)
-Port ${port}
-EOF
-    else
-        local tmp
-        tmp=$(mktemp)
-        TMP_FILES+=("$tmp")
-        { printf '# Port SSH défini par %s (%s)\nPort %s\n\n' "$SCRIPT_NAME" "$RUN_ID" "$port"
-          cat /etc/ssh/sshd_config; } >"$tmp"
-        cat "$tmp" >/etc/ssh/sshd_config   # « cat > » conserve droits et contexte SELinux
-    fi
+    # 2. Phase de test : l'ANCIEN port reste ouvert en plus du nouveau. Une session
+    #    perdue pendant le test n'empêche donc jamais de se reconnecter.
+    ssh_write_ports "${old_ports[@]}" "$port"
 
-    # 3. Socket systemd sans générateur (Ubuntu 22.10 – 23.10) : drop-in ListenStream
-    if [[ $SSH_SOCKET == true ]] && ! ssh_socket_generator_present; then
-        write_file "$SSH_SOCKET_DROPIN" 0644 <<EOF
-$(managed_header)
-[Socket]
-ListenStream=
-ListenStream=${port}
-EOF
-    fi
-
-    # 4. SELinux : sshd ne peut se lier qu'aux ports étiquetés ssh_port_t
+    # 3. SELinux : sshd ne peut se lier qu'aux ports étiquetés ssh_port_t
     if selinux_active; then
         if ! have semanage; then
             log_error "SELinux actif mais semanage absent : impossible d'autoriser le port ${port}."
@@ -1542,55 +1750,77 @@ EOF
             if ! semanage port -a -t ssh_port_t -p tcp "$port" >>"$LOG_FILE" 2>&1; then
                 run "SELinux : réétiquetage du port ${port}" semanage port -m -t ssh_port_t -p tcp "$port"
             fi
-            SSH_RB_SELINUX=true
+            : >"${SSH_RB_DIR}/selinux"
             log_ok "SELinux : port ${port}/tcp autorisé pour sshd (ssh_port_t)."
         fi
     fi
 
-    # 5. Pare-feu local
+    # 4. Pare-feu local
     if ! ssh_open_firewall "$port"; then
         ssh_rollback
         return 0
     fi
 
-    # 6. Validation puis application
+    # 5. Validation puis application (ancien + nouveau port)
     if ! sshd_test_config; then
         log_error "sshd -t refuse la nouvelle configuration."
         ssh_rollback
         return 0
     fi
     ssh_reload_service
-    if ! wait_for_port "$port" 15; then
-        log_error "sshd n'écoute pas sur le port ${port} après redémarrage."
+    if ! ssh_ports_listening "$port" "${old_ports[@]}"; then
+        log_error "sshd n'écoute pas sur ${port} et ${old_ports[*]} après redémarrage."
         ssh_rollback
         return 0
     fi
-    log_ok "sshd écoute sur le port ${port} (les sessions ouvertes restent actives)."
+    log_ok "sshd écoute sur ${port} ET sur ${old_ports[*]} (phase de test)."
 
-    # 7. Test de connexion par l'utilisateur, sinon retour arrière automatique
-    if has_tty; then
-        user=${SUDO_USER:-$(logname 2>/dev/null || echo root)}
-        {
-            printf '\n  %s┌─ TEST OBLIGATOIRE ─────────────────────────────────────────────%s\n' "$C_YELLOW" "$C_RESET"
-            printf '  %s│%s NE FERMEZ PAS cette session. Dans un AUTRE terminal, lancez :\n' "$C_YELLOW" "$C_RESET"
-            printf '  %s│%s     %sssh -p %s %s@%s%s\n' "$C_YELLOW" "$C_RESET" "$C_BOLD" "$port" "$user" "$(primary_ip)" "$C_RESET"
-            printf '  %s│%s Puis revenez ici. Sans « oui » sous %d s : retour au port %s.\n' "$C_YELLOW" "$C_RESET" "$SSH_CONFIRM_TIMEOUT" "${SSH_CONF_PORTS[*]}"
-            printf '  %s└────────────────────────────────────────────────────────────────%s\n' "$C_YELLOW" "$C_RESET"
-            printf '  %s?%s La connexion sur le port %s fonctionne-t-elle ? (oui/non) : ' "$C_CYAN" "$C_RESET" "$port"
-        } >/dev/tty
-        IFS= read -r -t "$SSH_CONFIRM_TIMEOUT" ans </dev/tty || { ans=""; printf '\n' >/dev/tty; }
-        case ${ans,,} in
-            o | oui | y | yes) _log_file ASK "Test SSH port ${port} → confirmé" ;;
-            *)
-                log_warn "Connexion non confirmée."
-                ssh_rollback
-                return 0
-                ;;
-        esac
-    else
-        log_warn "Mode non interactif : testez immédiatement « ssh -p ${port} … » depuis un autre poste."
+    # 6. Sans terminal : on ne peut pas faire confirmer → on garde les deux ports
+    if ! has_tty; then
+        ssh_rb_disarm
+        SSH_RB_ACTIVE=false
+        rm -rf "$SSH_RB_DIR"
+        SSH_FINAL_PORTS=$(IFS=,; echo "${old_ports[*]},${port}")
+        log_warn "Mode non interactif : SSH écoute sur ${SSH_FINAL_PORTS} (ancien port CONSERVÉ)."
+        log_warn "Après avoir testé « ssh -p ${port} … », relancez le script en interactif pour fermer ${old_ports[*]}."
+        return 0
     fi
 
+    # 7. Test de connexion par l'utilisateur, sinon retour arrière automatique
+    user=${SUDO_USER:-$(logname 2>/dev/null || echo root)}
+    {
+        printf '\n  %s┌─ TEST OBLIGATOIRE ─────────────────────────────────────────────%s\n' "$C_YELLOW" "$C_RESET"
+        printf '  %s│%s NE FERMEZ PAS cette session. Dans un AUTRE terminal, lancez :\n' "$C_YELLOW" "$C_RESET"
+        printf '  %s│%s     %sssh -p %s %s@%s%s\n' "$C_YELLOW" "$C_RESET" "$C_BOLD" "$port" "$user" "$(primary_ip)" "$C_RESET"
+        printf '  %s│%s Sans « oui » sous %d s : retour au port %s (même si cette session\n' "$C_YELLOW" "$C_RESET" "$SSH_CONFIRM_TIMEOUT" "${old_ports[*]}"
+        printf '  %s│%s est coupée : le retour arrière est indépendant de ce script).\n' "$C_YELLOW" "$C_RESET"
+        printf '  %s└────────────────────────────────────────────────────────────────%s\n' "$C_YELLOW" "$C_RESET"
+        printf '  %s?%s La connexion sur le port %s fonctionne-t-elle ? (oui/non) : ' "$C_CYAN" "$C_RESET" "$port"
+    } >/dev/tty
+    IFS= read -r -t "$SSH_CONFIRM_TIMEOUT" ans </dev/tty || { ans=""; printf '\n' >/dev/tty; }
+    case ${ans,,} in
+        o | oui | y | yes) _log_file ASK "Test SSH port ${port} → confirmé" ;;
+        *)
+            log_warn "Connexion non confirmée."
+            ssh_rollback
+            return 0
+            ;;
+    esac
+
+    # 8. Confirmé : on retire l'ancien port (le retour arrière reste armé jusqu'au bout)
+    ssh_write_ports "$port"
+    if ! sshd_test_config; then
+        log_error "sshd -t refuse la configuration finale."
+        ssh_rollback
+        return 0
+    fi
+    ssh_reload_service
+    if ! ssh_ports_listening "$port"; then
+        log_error "sshd n'écoute plus sur ${port} après retrait de l'ancien port."
+        ssh_rollback
+        return 0
+    fi
+    ssh_rb_disarm
     SSH_RB_ACTIVE=false
     rm -rf "$SSH_RB_DIR"
     SSH_FINAL_PORTS=$port
@@ -1775,20 +2005,34 @@ gen_restore_script() {
 # « fail2ban-client set <jail> attempt ». Il est lancé par systemd après chaque
 # démarrage de Fail2ban (ExecStartPost) et par fail2ban-setup.
 #
-# Les IP ayant déjà atteint le seuil sans être bannies (débannies à la main) sont
-# ignorées. Les échecs restaurés sont datés du redémarrage : ils expirent donc un
-# peu plus tard que les originaux (choix volontairement prudent).
+# Déduplication PAR IP ET PAR ÉVÉNEMENT (et non plus sur le compteur global de
+# la jail) : depuis le dernier « Starting Fail2ban » du journal, on relève
+#   • « [sshd-recidive] Found <IP> - <date> » : bans déjà relus par la jail (la date
+#     est celle de la ligne de ban d'origine → comparable à timeofban) ;
+#   • les injections déjà faites par ce script pour CE démarrage (fichier d'état).
+# Seuls les bans [sshd] ni relus ni déjà injectés sont réinjectés. Une IP B
+# fraîchement comptée n'empêche donc plus de restaurer l'historique d'une IP A.
+#
+# Les IP déjà bannies par la récidive, ou ayant déjà atteint le seuil sans être
+# bannies (débannies à la main), sont ignorées. Les échecs restaurés sont datés
+# du redémarrage : ils expirent un peu plus tard que les originaux (choix prudent).
 #
 import argparse
 import collections
 import datetime as dt
+import json
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import quote
+
+STATE_FILE = "/var/lib/fail2ban-setup/recidive-restore.json"
+TOLERANCE = 3  # secondes entre timeofban (base) et l'horodatage de la ligne « Ban »
 
 
 def log(msg):
@@ -1805,6 +2049,74 @@ def client(*args):
     return proc.stdout if proc.returncode == 0 else None
 
 
+def last_value(out):
+    """Dernière ligne/mot significatif d'une réponse « fail2ban-client get »."""
+    lines = [l.strip(" `|-") for l in (out or "").splitlines() if l.strip(" `|-")]
+    return lines[-1] if lines else ""
+
+
+def parse_since_start(logfile, jail):
+    """(marqueur du démarrage courant, {ip: [timestamps déjà relus]})."""
+    start, seen = None, collections.defaultdict(list)
+    found = re.compile(r"\[" + re.escape(jail) + r"\] Found (\S+) - (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)")
+    try:
+        with open(logfile, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "Starting Fail2ban" in line:
+                    start, seen = line.strip(), collections.defaultdict(list)
+                    continue
+                m = found.search(line)
+                if m:
+                    try:
+                        ts = time.mktime(time.strptime(m.group(2), "%Y-%m-%d %H:%M:%S"))
+                    except ValueError:
+                        continue
+                    seen[m.group(1)].append(ts)
+    except OSError as exc:
+        log("journal {} illisible ({}) : déduplication par journal impossible".format(logfile, exc))
+    return start, seen
+
+
+def load_state(marker):
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("start") == marker:
+            return {ip: list(v) for ip, v in data.get("injected", {}).items()}
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {}
+
+
+def save_state(marker, injected):
+    os.makedirs(os.path.dirname(STATE_FILE), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_FILE))
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"start": marker, "injected": injected}, fh)
+    os.replace(tmp, STATE_FILE)
+
+
+def wait_stable(jail, minimum, quiet=5, maximum=45):
+    start = last_change = time.time()
+    last = None
+    while True:
+        m = re.search(r"Total failed:\s*(\d+)", client("status", jail) or "")
+        cur = m.group(1) if m else None
+        now = time.time()
+        if cur != last:
+            last, last_change = cur, now
+        if now - start >= minimum and now - last_change >= quiet:
+            return
+        if now - start >= maximum:
+            log("compteur de {} encore instable après {} s : poursuite".format(jail, maximum))
+            return
+        time.sleep(1)
+
+
+def already(ts, stamps):
+    return any(abs(ts - s) <= TOLERANCE for s in stamps)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Restaure le compteur de la jail de récidive depuis la base Fail2ban.")
@@ -1813,6 +2125,7 @@ def main():
                         help="jail de récidive (défaut : sshd-recidive)")
     parser.add_argument("--wait", type=int, default=60,
                         help="attente maximale du démarrage de Fail2ban, en secondes")
+    parser.add_argument("--logfile", help="journal Fail2ban (défaut : logtarget du serveur)")
     parser.add_argument("-n", "--dry-run", action="store_true", help="affiche sans rien injecter")
     parser.add_argument("-V", "--version", action="version", version="%(prog)s " + __version__)
     args = parser.parse_args()
@@ -1828,16 +2141,11 @@ def main():
     if status is None:
         log("jail {} inactive : rien à faire".format(args.recidive))
         return 0
-    failed = re.search(r"Currently failed:\s*(\d+)", status)
-    if failed and int(failed.group(1)) > 0:
-        # La jail a déjà relu ses journaux (premier démarrage, rotation…) : pas de doublon
-        log("compteur déjà alimenté, rien à restaurer")
-        return 0
     banned = re.search(r"Banned IP list:\s*(.*)", status)
     banned = set(banned.group(1).split()) if banned else set()
     try:
-        findtime = int((client("get", args.recidive, "findtime") or "").strip())
-        maxretry = int((client("get", args.recidive, "maxretry") or "").strip())
+        findtime = int(last_value(client("get", args.recidive, "findtime")))
+        maxretry = int(last_value(client("get", args.recidive, "maxretry")))
     except ValueError:
         log("impossible de lire findtime/maxretry de {}".format(args.recidive))
         return 1
@@ -1845,6 +2153,20 @@ def main():
     if not dbfile:
         log("base de données Fail2ban désactivée : rien à restaurer")
         return 0
+    logfile = args.logfile or last_value(client("get", "logtarget"))
+    if not logfile.startswith("/"):
+        log("logtarget « {} » n'est pas un fichier : restauration impossible sans doublons".format(logfile))
+        return 1
+
+    # La jail relit ses journaux en tâche de fond (backend polling : plusieurs
+    # secondes après le démarrage). On attend que « Total failed » ne bouge plus
+    # pendant 5 s (au moins 8 s, au plus 45 s) avant de comparer avec la base.
+    wait_stable(args.recidive, 0 if args.dry_run else 8)
+    marker, seen = parse_since_start(logfile, args.recidive)
+    if marker is None:
+        log("aucun « Starting Fail2ban » dans {} : abandon prudent".format(logfile))
+        return 1
+    injected = load_state(marker)
 
     con = sqlite3.connect("file:{}?mode=ro".format(quote(dbfile.group(1))), uri=True, timeout=30)
     try:
@@ -1856,20 +2178,31 @@ def main():
     for ip, ts in rows:
         history.setdefault(ip, []).append(ts)
 
-    restored = 0
+    restored = events = 0
     for ip, stamps in history.items():
         if ip in banned or len(stamps) >= maxretry:
             continue
+        counted = seen.get(ip, []) + injected.get(ip, [])
+        todo = [ts for ts in stamps if not already(ts, counted)]
+        if not todo:
+            continue
         matches = ["[{}] Ban {} du {:%Y-%m-%d %H:%M:%S} (compteur restauré)".format(
-            args.source, ip, dt.datetime.fromtimestamp(ts)) for ts in stamps]
+            args.source, ip, dt.datetime.fromtimestamp(ts)) for ts in todo]
         if args.dry_run:
-            print("{} : {} ban(s) {}".format(ip, len(stamps), args.source))
+            print("{} : {} ban(s) {} à restaurer ({} déjà compté(s))".format(
+                ip, len(todo), args.source, len(stamps) - len(todo)))
         elif client("set", args.recidive, "attempt", ip, *matches) is None:
             log("échec de la restauration pour {}".format(ip))
             continue
+        else:
+            injected.setdefault(ip, []).extend(todo)
         restored += 1
-    log("{} IP restaurée(s) dans {} (bans [{}] des {} derniers jours, seuil {})".format(
-        restored, args.recidive, args.source, findtime // 86400, maxretry))
+        events += len(todo)
+    if not args.dry_run:
+        save_state(marker, injected)
+    log("{} IP / {} ban(s) {} dans {} (bans [{}] des {} derniers jours, seuil {})".format(
+        restored, events, "à restaurer (simulation)" if args.dry_run else "restauré(s)",
+        args.recidive, args.source, findtime // 86400, maxretry))
     return 0
 
 
@@ -2056,6 +2389,40 @@ ${mm} ${hh} * * ${dow_cron} root ${REPORT_BIN} 2>&1 | logger -t fail2ban-report
 EOF
         log_ok "Cron : chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME} (${CRON_FILE})"
     fi
+}
+
+# Une planification du rapport posée par ce script existe-t-elle ?
+report_schedule_present() {
+    local f
+    for f in "${SYSTEMD_DIR}/${REPORT_UNIT}.timer" "$CRON_FILE"; do
+        [[ -f $f ]] && grep -q "$MANAGED_MARK" "$f" && return 0
+    done
+    [[ -f /etc/crontabs/root ]] && grep -q 'fail2ban-report' /etc/crontabs/root && return 0
+    return 1
+}
+
+# --no-report : arrête réellement les envois (timer/cron) ; le générateur reste
+# disponible pour un usage manuel. Les fichiers retirés sont sauvegardés.
+remove_report_schedule() {
+    log_step "Désactivation du rapport hebdomadaire (--no-report)"
+    local f
+    if [[ $INIT_SYSTEM == systemd ]]; then
+        systemctl disable --now "${REPORT_UNIT}.timer" >>"$LOG_FILE" 2>&1 || true
+    fi
+    for f in "${SYSTEMD_DIR}/${REPORT_UNIT}.timer" "${SYSTEMD_DIR}/${REPORT_UNIT}.service" "$CRON_FILE"; do
+        if [[ -f $f ]] && grep -q "$MANAGED_MARK" "$f"; then
+            backup_file "$f"
+            rm -f -- "$f"
+            log_ok "Supprimé : $f"
+        fi
+    done
+    if [[ -f /etc/crontabs/root ]] && grep -q 'fail2ban-report' /etc/crontabs/root; then
+        backup_file /etc/crontabs/root
+        sed -i '/fail2ban-report/d' /etc/crontabs/root
+        log_ok "Entrée retirée de /etc/crontabs/root"
+    fi
+    if [[ $INIT_SYSTEM == systemd ]]; then systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true; fi
+    log_ok "Plus aucun rapport ne sera envoyé (générateur conservé : ${REPORT_BIN} --stdout)."
 }
 
 install_report() {
@@ -2816,6 +3183,7 @@ uninstall() {
 final_summary() {
     log_step "Terminé"
     local rep="non installé"
+    [[ $REPORT_REMOVE == true ]] && rep="désactivé (planification retirée)"
     if [[ $REPORT_ENABLED == true ]]; then
         rep="chaque $(day_fr "$REPORT_DAY") à ${REPORT_TIME} → ${REPORT_TO}"
     fi
@@ -2862,8 +3230,9 @@ parse_args() {
             --keep-ssh-port) OPT_KEEP_SSH_PORT=true ;;
             --no-report) OPT_NO_REPORT=true ;;
             --no-recidive-mail) OPT_RECIDIVE_MAIL=false ;;
+            --force-hypervisor) OPT_FORCE_HYPERVISOR=true ;;
             --ssh-port | --ssh-mode | --ignore-ip | --email | --from | --smtp-host | --smtp-port | \
-                --smtp-user | --report-day | --report-time)
+                --smtp-user | --smtp-tls | --report-day | --report-time)
                 if [[ -z $val ]]; then
                     (($# >= 2)) || die "L'option ${opt} attend une valeur."
                     val=$2
@@ -2878,6 +3247,7 @@ parse_args() {
                     --smtp-host) OPT_SMTP_HOST=$val ;;
                     --smtp-port) OPT_SMTP_PORT=$val ;;
                     --smtp-user) OPT_SMTP_USER=$val ;;
+                    --smtp-tls) SMTP_TLS_LEVEL=$val ;;
                     --report-day) OPT_REPORT_DAY=$val ;;
                     --report-time) OPT_REPORT_TIME=$val ;;
                 esac
@@ -2888,6 +3258,12 @@ parse_args() {
     done
     if [[ -n $OPT_REPORT_DAY ]] && ! is_day "$OPT_REPORT_DAY"; then die "--report-day invalide : ${OPT_REPORT_DAY}"; fi
     if [[ -n $OPT_REPORT_TIME ]] && ! is_hhmm "$OPT_REPORT_TIME"; then die "--report-time invalide : ${OPT_REPORT_TIME}"; fi
+    case $SMTP_TLS_LEVEL in
+        secure | encrypt) ;;
+        *) die "--smtp-tls invalide : ${SMTP_TLS_LEVEL} (secure|encrypt). TLS facultatif non pris en charge." ;;
+    esac
+    is_uint "$SSH_CONFIRM_TIMEOUT" || die "SSH_CONFIRM_TIMEOUT invalide : ${SSH_CONFIRM_TIMEOUT}"
+    is_uint "$SSH_RB_GRACE" || die "SSH_RB_GRACE invalide : ${SSH_RB_GRACE}"
     if [[ -n $OPT_SSH_PORT ]] && ! is_port "$OPT_SSH_PORT"; then die "--ssh-port invalide : ${OPT_SSH_PORT}"; fi
     if [[ -n $OPT_IGNORE_IP ]] && ! is_ip_list_or_empty "$OPT_IGNORE_IP"; then die "--ignore-ip invalide : ${OPT_IGNORE_IP}"; fi
     return 0
@@ -2915,8 +3291,8 @@ on_error() {
 }
 
 on_interrupt() {
-    trap - ERR INT TERM
-    printf '\n' >&2
+    trap - ERR INT TERM HUP
+    printf '\n' >&2 2>/dev/null || true
     log_warn "Interruption demandée."
     ssh_rollback
     exit 130
@@ -2933,7 +3309,7 @@ main() {
 
     trap cleanup EXIT
     trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
-    trap on_interrupt INT TERM
+    trap on_interrupt INT TERM HUP
 
     if have flock; then
         exec 9>"$LOCK_FILE"
@@ -2947,6 +3323,11 @@ main() {
         detect) exit 0 ;;
         uninstall) uninstall; exit 0 ;;
     esac
+    check_hypervisor
+    if [[ $CONTAINER_VIRT != none ]]; then
+        log_warn "Conteneur détecté (${CONTAINER_VIRT}) : les bans nécessitent CAP_NET_ADMIN et un"
+        log_warn "pare-feu propre au conteneur ; sinon protégez SSH depuis l'hôte."
+    fi
 
     [[ -n $SSHD_BIN ]] || die "OpenSSH server n'est pas installé : ce script protège SSH, installez-le d'abord."
     validate_parameters
@@ -2962,6 +3343,7 @@ main() {
     write_fail2ban_config
     start_fail2ban
     if [[ $REPORT_ENABLED == true ]]; then install_report; fi
+    if [[ $REPORT_REMOVE == true ]]; then remove_report_schedule; fi
     save_answers
     final_summary
     if ((JAIL_ERRORS > 0)); then exit 1; fi
