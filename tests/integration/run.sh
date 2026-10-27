@@ -10,7 +10,7 @@ ENGINE=$(command -v podman || command -v docker) || { echo "podman ou docker req
 DISTROS=("$@")
 ((${#DISTROS[@]})) || DISTROS=(debian13 rocky9 alpine322)
 # F2B_TESTS="test_install.sh …" pour n'en lancer qu'une partie
-read -r -a TESTS <<<"${F2B_TESTS:-test_ssh_rollback.sh test_install.sh test_recidive_restore.sh}"
+read -r -a TESTS <<<"${F2B_TESTS:-test_ssh_rollback.sh test_install.sh test_plesk_compat.sh test_recidive_restore.sh}"
 failed=()
 
 for d in "${DISTROS[@]}"; do

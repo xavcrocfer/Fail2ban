@@ -1105,6 +1105,37 @@ EOF
     log_ok "$(fail2ban-client --version 2>/dev/null | head -n 1 || echo Fail2ban) installé"
 }
 
+f2b_action_exists() {
+    [[ -r ${F2B_ETC}/action.d/$1.conf ]]
+}
+
+select_available_banaction() {
+    # Certaines distributions administrées (notamment Plesk) fournissent la
+    # commande nft, mais ne déploient dans /etc/fail2ban/action.d que les actions
+    # iptables. Une action choisie d'après le seul pare-feu rendrait alors toute
+    # la configuration invalide. Contrôler les fichiers réellement installés
+    # après l'installation du paquet et se rabattre sur une paire complète.
+    if f2b_action_exists "$BANACTION" && f2b_action_exists "$BANACTION_ALLPORTS"; then
+        return 0
+    fi
+
+    local previous="${BANACTION} / ${BANACTION_ALLPORTS}"
+    if have iptables && f2b_action_exists iptables-multiport && f2b_action_exists iptables-allports; then
+        BANACTION=iptables-multiport
+        BANACTION_ALLPORTS=iptables-allports
+        log_warn "Actions ${previous} absentes ; repli sur ${BANACTION} / ${BANACTION_ALLPORTS}."
+        return 0
+    fi
+    if have nft && f2b_action_exists nftables-multiport && f2b_action_exists nftables-allports; then
+        BANACTION=nftables-multiport
+        BANACTION_ALLPORTS=nftables-allports
+        log_warn "Actions ${previous} absentes ; repli sur ${BANACTION} / ${BANACTION_ALLPORTS}."
+        return 0
+    fi
+
+    die "Aucune paire d'actions Fail2ban multiport/allports utilisable dans ${F2B_ETC}/action.d."
+}
+
 # Interpréteur Python utilisé par Fail2ban (même interpréteur pour le rapport)
 detect_python() {
     local server line cand="" w
@@ -1967,7 +1998,7 @@ EOF
 }
 
 gen_f2b_jail_sshd() {
-    local backend_block recidive_action=""
+    local backend_block recidive_mail=""
     if [[ $F2B_BACKEND == systemd ]]; then
         # _COMM=sshd-session / sshd-auth : OpenSSH >= 9.8 sépare le démon en plusieurs binaires
         backend_block="backend      = systemd
@@ -1977,8 +2008,7 @@ journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service + _COMM=ss
 logpath      = ${SSH_LOGPATH}"
     fi
     if [[ $OPT_RECIDIVE_MAIL == true && $REPORT_ENABLED == true && $MAIL_MODE != none ]]; then
-        recidive_action='action    = %(action_)s
-            mail-recidive[name=%(__name__)s, dest="%(destemail)s", sender="%(sender)s", sendername="%(sendername)s"]'
+        recidive_mail='            mail-recidive[name=%(__name__)s, dest="%(destemail)s", sender="%(sender)s", sendername="%(sendername)s"]'
     fi
 
     managed_header
@@ -1999,6 +2029,8 @@ logpath      = ${SSH_LOGPATH}"
 enabled      = true
 port         = ${SSH_FINAL_PORTS}
 mode         = ${SSH_MODE}
+# Action explicite : les installations Plesk peuvent ne pas fournir la macro action_.
+action       = ${BANACTION}[name=%(__name__)s, port="%(port)s"]
 # _daemon élargi : OpenSSH >= 9.8 journalise sous « sshd-session » / « sshd-auth »
 filter       = sshd[mode=%(mode)s, _daemon="sshd(?:-session|-auth)?"${SSH_FILTER_EXTRA}]
 ${backend_block}
@@ -2016,7 +2048,9 @@ banaction = %(banaction_allports)s
 maxretry  = ${RECIDIVE_MAXRETRY}
 findtime  = ${RECIDIVE_FINDTIME}
 bantime   = ${RECIDIVE_BANTIME}
-${recidive_action}
+# Action de ban autonome, suivie éventuellement de la notification par email.
+action    = ${BANACTION_ALLPORTS}[name=%(__name__)s]
+${recidive_mail}
 EOF
 }
 
@@ -4346,6 +4380,7 @@ main() {
     show_plan
 
     install_packages
+    select_available_banaction
     detect_python
     decide_backend
     if [[ $MAIL_MODE == relay ]]; then configure_postfix_relay; fi
